@@ -16,6 +16,8 @@ CI の状態取得を別枠の **GraphQL** で行い、取得結果を **ファ�
    TTL(既定 15 秒)内は再取得せずキャッシュを返します。同時に取りに行く場合も、軽量ロックで 1 回に集約します。
    常駐デーモンは持ちません(ファイルだけで協調します)。
 
+内部構成と設計判断は [DESIGN.md](DESIGN.md)、開発者向けの規約は [AGENTS.md](AGENTS.md) を参照してください。
+
 ## インストール
 
 ```powershell
@@ -24,7 +26,8 @@ cargo install --path .
 cargo build --release   # target\release\vigilia.exe
 ```
 
-対応: Windows x64(主)、macOS Apple Silicon。Intel Mac は対象外です。
+対応: Windows x64(主)、macOS Apple Silicon。Intel Mac は対象外です(Linux は CI でビルド・テストのみ)。
+前提は Rust(edition 2024 対応の stable)と、認証に使う `gh` です。
 
 認証は既存の `gh` を借ります(`gh auth token`)。環境変数 `GH_TOKEN` / `GITHUB_TOKEN` があればそれを優先します。
 トークンはログ・出力・キャッシュのいずれにも書き出しません。
