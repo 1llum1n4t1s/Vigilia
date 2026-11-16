@@ -17,8 +17,11 @@ pub struct Snapshot {
     pub sha: String,
     /// 関連する check suite(ワークフロー run 単位)。
     pub suites: Vec<Suite>,
-    /// check suite / check run が上限を超えて切り捨てられた可能性がある。
+    /// check run(job)が上限を超えて切り捨てられた。表示上の注意のみ(suite 自体の結論は GitHub が集計済み)。
     pub truncated: bool,
+    /// check suite が上限を超えて切り捨てられた。結論(特に「成功」)を保証できない。
+    #[serde(default)]
+    pub suites_truncated: bool,
     /// この取得で消費した GraphQL コストと残り枠(取得できた場合)。
     pub cost: Option<CostInfo>,
 }
@@ -97,6 +100,20 @@ fn is_cancel_conclusion(c: &str) -> bool {
 }
 
 impl Snapshot {
+    /// 結論を返す。ただし check suite が切り捨てられた状態で「成功」とは断定できないため、
+    /// その場合はエラーにする(取りこぼした suite が失敗している可能性がある)。
+    pub fn conclusive_overall(&self) -> Result<Overall> {
+        let overall = self.overall();
+        if self.suites_truncated && overall == Overall::Success {
+            return Err(VigiliaError::Api(
+                "check suite が取得上限(50 件)を超えており、成功と断定できません。\
+                 GitHub の画面で確認してください"
+                    .into(),
+            ));
+        }
+        Ok(overall)
+    }
+
     /// 全 suite を畳み込んだ結論。
     /// 未完了が 1 つでもあれば実行中、全完了なら 失敗 > 取消 > 成功 の優先順。
     pub fn overall(&self) -> Overall {
@@ -374,11 +391,10 @@ pub fn parse_commit_response(value: &serde_json::Value, target: &str) -> Result<
         VigiliaError::NotFound(format!("{target} はコミットを指していません"))
     })?;
     let mut truncated = false;
+    let mut suites_truncated = false;
     let mut suites = Vec::new();
     if let Some(conn) = commit.check_suites {
-        if conn.page_info.map(|p| p.has_next_page).unwrap_or(false) {
-            truncated = true;
-        }
+        suites_truncated = conn.page_info.map(|p| p.has_next_page).unwrap_or(false);
         for raw in conn.nodes.unwrap_or_default().into_iter().flatten() {
             let (s, t) = convert_suite(raw);
             truncated |= t;
@@ -392,6 +408,7 @@ pub fn parse_commit_response(value: &serde_json::Value, target: &str) -> Result<
         sha: oid,
         suites,
         truncated,
+        suites_truncated,
         cost: cost_of(data.rate_limit),
     })
 }
@@ -411,6 +428,7 @@ pub fn parse_run_response(value: &serde_json::Value, run_id: u64) -> Result<Snap
         sha: cs.commit.oid,
         suites: vec![suite],
         truncated,
+        suites_truncated: false,
         cost: cost_of(data.rate_limit),
     })
 }
@@ -484,6 +502,23 @@ mod tests {
         snap.suites.truncate(1);
         snap.suites[0].conclusion = Some("SKIPPED".into());
         assert_eq!(snap.overall(), Overall::Success);
+    }
+
+    #[test]
+    fn suite切り捨て時は成功と断定しない() {
+        let mut snap = parse_commit_response(&commit_fixture(), "x").unwrap();
+        snap.suites[0].status = "COMPLETED".into();
+        snap.suites[0].conclusion = Some("SUCCESS".into());
+        snap.suites_truncated = true;
+        assert!(matches!(snap.conclusive_overall(), Err(VigiliaError::Api(_))));
+        // 失敗は切り捨てがあっても確定できる。
+        snap.suites[0].conclusion = Some("FAILURE".into());
+        assert_eq!(snap.conclusive_overall().unwrap(), Overall::Failure);
+        // pageInfo の hasNextPage から検知される。
+        let mut v = commit_fixture();
+        v["data"]["repository"]["object"]["checkSuites"]["pageInfo"]["hasNextPage"] =
+            serde_json::json!(true);
+        assert!(parse_commit_response(&v, "x").unwrap().suites_truncated);
     }
 
     #[test]

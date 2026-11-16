@@ -32,6 +32,11 @@ fn build_resolver(a: &TargetArgs) -> Result<Resolver> {
     ))
 }
 
+/// レート制限時の待ち時間。示された時間を尊重しつつ、`--interval` より短くはしない。
+fn rate_wait(interval: Duration, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or(interval).max(interval)
+}
+
 /// 結論 → 終了コード。
 fn overall_code(o: Overall) -> i32 {
     match o {
@@ -50,7 +55,7 @@ fn overall_code(o: Overall) -> i32 {
 pub fn status(a: &StatusArgs) -> Result<i32> {
     let mut resolver = build_resolver(&a.target)?;
     let fetched = resolver.get()?;
-    let overall = fetched.snapshot.overall();
+    let overall = fetched.snapshot.conclusive_overall()?;
     if a.json {
         let out = json!({
             "overall": overall,
@@ -126,7 +131,7 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
                     header_printed = true;
                 }
                 print_changes(&f.snapshot, &mut seen);
-                let overall = f.snapshot.overall();
+                let overall = f.snapshot.conclusive_overall()?;
                 if overall.is_terminal() {
                     print_final(&f.snapshot, overall);
                     return Ok(overall_code(overall));
@@ -139,10 +144,23 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
                         a.wait_for_runs
                     )));
                 }
+                // レート制限で古いキャッシュを返された場合は、示された待ち時間の間 API を叩かない。
+                if f.source == Source::StaleCache {
+                    let wait = rate_wait(interval, f.retry_after);
+                    if started.elapsed() + wait >= timeout {
+                        return Err(VigiliaError::RateLimited {
+                            retry_after: f.retry_after,
+                            message: "古いキャッシュのまま --timeout に達します".into(),
+                        });
+                    }
+                    eprintln!("レート制限中: {}秒待機して再開します", wait.as_secs());
+                    std::thread::sleep(wait);
+                    continue;
+                }
             }
             Err(VigiliaError::RateLimited { retry_after, message }) => {
                 // 落とさずに、示された時間(分からなければ interval)だけ待って再開する。
-                let wait = retry_after.unwrap_or(interval).max(interval);
+                let wait = rate_wait(interval, retry_after);
                 if started.elapsed() + wait >= timeout {
                     return Err(VigiliaError::RateLimited { retry_after, message });
                 }
@@ -241,6 +259,14 @@ mod tests {
         assert_eq!(overall_code(Overall::Cancelled), 3);
         assert_eq!(overall_code(Overall::InProgress), 6);
         assert_eq!(overall_code(Overall::NoRuns), 7);
+    }
+
+    #[test]
+    fn レート制限の待ち時間はretry_afterを尊重しintervalを下回らない() {
+        let i = Duration::from_secs(20);
+        assert_eq!(rate_wait(i, Some(Duration::from_secs(300))), Duration::from_secs(300));
+        assert_eq!(rate_wait(i, Some(Duration::from_secs(3))), i);
+        assert_eq!(rate_wait(i, None), i);
     }
 
     #[test]

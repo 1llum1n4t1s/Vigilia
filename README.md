@@ -105,7 +105,7 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 - run id → run の解決には、GitHub が非推奨としているレガシー形式のグローバル ID(`011:WorkflowRun<id>`)を使います。
   REST を使わずに run id から引ける経路がこれしかないためです。将来廃止された場合は run id 指定だけが API エラーになります
   (SHA 指定は影響を受けません)。
-- 1 コミットあたり check suite は 10 件、1 suite あたり check run は 30 件(run id 指定は 50 件)まで取得し、超える場合は
+- 1 コミットあたり check suite は 50 件、1 suite あたり check run は 30 件(run id 指定は 50 件)まで取得します。suite が上限を超えて成功に見える場合は成功と断定せずエラー(終了コード 2)にし、job の超過は
   「一部を省略」と表示します。
 - check run を持たない非 Actions アプリの check suite は、完了しないことがあるため監視対象から除外します。
 

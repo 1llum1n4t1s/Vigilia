@@ -159,12 +159,12 @@ impl Cache {
         }
         // Windows の rename は既存ファイルを置換する。読み手が掴んでいて失敗した場合は短くリトライ。
         let mut last = None;
-        for _ in 0..5 {
+        for _ in 0..12 {
             match fs::rename(&tmp, &target) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     last = Some(e);
-                    std::thread::sleep(Duration::from_millis(40));
+                    std::thread::sleep(Duration::from_millis(30));
                 }
             }
         }
@@ -276,6 +276,7 @@ mod tests {
                 jobs: vec![],
             }],
             truncated: false,
+            suites_truncated: false,
             cost: None,
         }
     }

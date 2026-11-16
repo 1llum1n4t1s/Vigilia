@@ -35,6 +35,9 @@ pub struct Fetched {
     pub source: Source,
     /// 取得からの経過(API 直取得は 0)。
     pub age: Duration,
+    /// `StaleCache` のとき、GitHub が示した再試行までの待ち時間(`Retry-After` 等)。
+    /// 呼び出し側(watch)はこの間 API を叩かないこと。
+    pub retry_after: Option<Duration>,
 }
 
 pub struct Resolver {
@@ -98,7 +101,12 @@ impl Resolver {
     pub fn get(&mut self) -> Result<Fetched> {
         let Some(key) = self.cache.as_ref().map(|_| self.key()) else {
             let snapshot = self.fetch_api()?;
-            return Ok(Fetched { snapshot, source: Source::Api, age: Duration::ZERO });
+            return Ok(Fetched {
+                snapshot,
+                source: Source::Api,
+                age: Duration::ZERO,
+                retry_after: None,
+            });
         };
         let (hit, guard) = self
             .cache
@@ -107,7 +115,12 @@ impl Resolver {
             .get_or_lock(&key, self.ttl);
         if let Some(entry) = hit {
             let age = entry.age(cache::now_ms());
-            return Ok(Fetched { snapshot: entry.snapshot, source: Source::Cache, age });
+            return Ok(Fetched {
+                snapshot: entry.snapshot,
+                source: Source::Cache,
+                age,
+                retry_after: None,
+            });
         }
         // ここへ来たら自分が取得役(ロックは guard が保持。Drop で解放)。
         let result = self.fetch_api();
@@ -117,14 +130,27 @@ impl Resolver {
                 if let Err(e) = cache.write(&key, &snapshot) {
                     eprintln!("警告: キャッシュへ書き込めません({e})");
                 }
-                Ok(Fetched { snapshot, source: Source::Api, age: Duration::ZERO })
+                Ok(Fetched {
+                    snapshot,
+                    source: Source::Api,
+                    age: Duration::ZERO,
+                    retry_after: None,
+                })
             }
             // レート制限時は、古くても共有キャッシュがあればそれを返して継続できるようにする。
-            Err(VigiliaError::RateLimited { .. }) if cache.read(&key).is_some() => {
-                let entry = cache.read(&key).expect("直前に存在確認済み");
-                let age = entry.age(cache::now_ms());
-                Ok(Fetched { snapshot: entry.snapshot, source: Source::StaleCache, age })
-            }
+            // 待ち時間は捨てずに返し、呼び出し側が API を叩かず待てるようにする。
+            Err(VigiliaError::RateLimited { retry_after, message }) => match cache.read(&key) {
+                Some(entry) => {
+                    let age = entry.age(cache::now_ms());
+                    Ok(Fetched {
+                        snapshot: entry.snapshot,
+                        source: Source::StaleCache,
+                        age,
+                        retry_after: Some(retry_after.unwrap_or_default()),
+                    })
+                }
+                None => Err(VigiliaError::RateLimited { retry_after, message }),
+            },
             Err(e) => Err(e),
         };
         drop(guard);

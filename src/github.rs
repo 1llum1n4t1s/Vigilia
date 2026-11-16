@@ -29,8 +29,9 @@ const DEFAULT_RATE_WAIT: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 3;
 
 // sha 起点: checkSuites を 1 クエリで取得する。
-// コスト(ノード数/100 の切り上げ)を抑えるため suite は 10、job は 30 に制限し、
-// 超過は pageInfo で検知して `truncated` として利用者に知らせる。
+// コストは「必要なリクエスト数/100」で数えられるため、suite 50 × job 30 でも cost は小さい
+// (実測で確認すること)。超過は pageInfo で検知する。suite の切り捨ては結論を保証できないため、
+// 成功扱いにせずエラーにする(commands 側)。job の切り捨ては表示上の注意のみ。
 const COMMIT_QUERY: &str = r#"
 query($owner:String!,$name:String!,$expr:String!){
   repository(owner:$owner,name:$name){
@@ -38,7 +39,7 @@ query($owner:String!,$name:String!,$expr:String!){
     object(expression:$expr){
       ... on Commit {
         oid
-        checkSuites(first:10){
+        checkSuites(first:50){
           pageInfo{hasNextPage}
           nodes{
             app{name} status conclusion

@@ -94,7 +94,7 @@ pub fn render_snapshot(snap: &Snapshot, now: DateTime<Utc>) -> String {
             out.push_str(&format!("    {url}\n"));
         }
     }
-    if snap.truncated {
+    if snap.truncated || snap.suites_truncated {
         out.push_str("  注意: suite / job が多いため一部を省略しています\n");
     }
     out
