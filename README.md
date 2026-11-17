@@ -1,50 +1,46 @@
+**English** | [日本語](README.ja.md)
+
 # Vigilia
 
-Vigilia(ラテン語で「見張り」)は、**GitHub REST の API 枠を使わずに** GitHub Actions の状態を見張る小さな CLI です。
-CI の状態取得を別枠の **GraphQL** で行い、取得結果を **ファイルキャッシュで複数セッション間に共有**します。
+Vigilia is a small CLI that watches GitHub Actions **without spending your GitHub REST API rate limit**. It reads CI state through the separate **GraphQL** quota and **shares the result between sessions through a file cache**. Published by Kagayoi.
 
-## なぜ作ったか(設計の根拠)
+## The problem
 
-複数の Claude Code セッションが同じ GitHub アカウントで `gh run watch` や `gh run view` を polling すると、
-**認証ユーザー単位で共有される REST の枠(5,000 回/時)** を全セッションが食い潰し、
-`HTTP 403: API rate limit exceeded` が頻発します。待つだけでは総速度が上がらないため、次の 2 点で対処します。
+When several AI agent sessions (or scripts) run under the same GitHub account and poll with `gh run watch` or `gh run view`, they all draw from **one REST quota per authenticated user (5,000 requests per hour)**. Once it is exhausted, every session fails with `HTTP 403: API rate limit exceeded`, and waiting does not make the total faster. Vigilia addresses this in two ways:
 
-1. **GraphQL で取得する**: GraphQL の枠(5,000 ポイント/時)は REST と別に数えられ、ほぼ未使用です。
-   `checkSuites` / `workflowRun` / `checkRuns` を 1 クエリにまとめ、コストは 1 回あたり 1〜3 ポイントほどです。
-   REST の枠が 0 でも動作します(使うのは `POST /graphql` と、枠を消費しない `GET /rate_limit` だけ)。
-2. **結果を共有する**: 取得結果を `%LOCALAPPDATA%\Vigilia\cache` に保存し、同じ対象を別セッションが見ていても
-   TTL(既定 15 秒)内は再取得せずキャッシュを返します。同時に取りに行く場合も、軽量ロックで 1 回に集約します。
-   常駐デーモンは持ちません(ファイルだけで協調します)。
+1. **It uses GraphQL only.** The GraphQL quota (5,000 points per hour) is counted separately from REST and is normally almost unused. `checkSuites` / `workflowRun` / `checkRuns` are combined into one query that costs a few points per request. Vigilia keeps working when the REST quota is 0: it only calls `POST /graphql` and `GET /rate_limit`, which does not consume quota.
+2. **It shares results.** Fetched snapshots are stored in a local cache. While a snapshot is fresh (TTL 15 seconds by default), other sessions watching the same target get the cached copy instead of querying again, and concurrent fetches are collapsed into one with a lightweight lock. There is no daemon; sessions coordinate through files only.
 
-内部構成と設計判断は [DESIGN.md](DESIGN.md)、開発者向けの規約は [AGENTS.md](AGENTS.md) を参照してください。
+Internals and design decisions are in [DESIGN.md](DESIGN.md); contributor conventions are in [AGENTS.md](AGENTS.md).
 
-## インストール
+## Installation
 
-```powershell
-cargo install --path .
-# または
-cargo build --release   # target\release\vigilia.exe
+No prebuilt binaries are published. Install from source with Rust (a stable toolchain that supports edition 2024):
+
+```sh
+cargo install --git https://github.com/1llum1n4t1s/Vigilia
 ```
 
-対応: Windows x64(主)、macOS Apple Silicon。Intel Mac は対象外です(Linux は CI でビルド・テストのみ)。
-前提は Rust(edition 2024 対応の stable)と、認証に使う `gh` です。
+or clone the repository and build it:
 
-認証は既存の `gh` を借ります(`gh auth token`)。環境変数 `GH_TOKEN` / `GITHUB_TOKEN` があればそれを優先します。
-トークンはログ・出力・キャッシュのいずれにも書き出しません。
-
-## 使い方
-
-```text
-vigilia watch  [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--interval 20] [--timeout 3600] [--wait-for-runs 120] [--ttl 15] [--no-cache]
-vigilia status [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--json] [--ttl 15] [--no-cache]
-vigilia budget [--json]
+```sh
+cargo build --release   # target/release/vigilia (vigilia.exe on Windows)
 ```
 
-- 対象は **run id**(数字 9 桁以上)または **コミット SHA**(16 進 7〜40 桁、短縮可)。省略または `HEAD` でカレントの `HEAD`。
-- `--repo` を省略するとカレントの git remote(`origin` 優先、github.com のみ)から推定します。run id のときは不要です。
-- SHA を指定すると、そのコミットの全 check suite(ワークフロー)をまとめて監視し、すべて完了した時点で結論を出します。
+CI builds, tests and lints on Windows x64, Apple Silicon macOS and Linux. Intel Macs are not supported.
 
-### 出力例
+Authentication borrows your existing GitHub CLI login (`gh auth token`), so `gh` must be installed and signed in. If `GH_TOKEN` or `GITHUB_TOKEN` is set, it takes precedence. The token is never written to logs, output or the cache.
+
+## Quick start
+
+```sh
+git push
+vigilia watch HEAD      # wait until every workflow for HEAD finishes
+vigilia status HEAD     # print the current state once
+vigilia budget          # show remaining REST / GraphQL / search quota
+```
+
+Example:
 
 ```text
 $ vigilia watch e8c8bb3
@@ -57,29 +53,27 @@ $ vigilia watch e8c8bb3
 結論: 失敗 (1llum1n4t1s/CleanReload @ e8c8bb3)
 ```
 
-`watch` は状態が変わった job だけを出力します。`status` は全 job を 1 回表示し、`--json` で機械可読にできます。
+Command output is in Japanese. `watch` prints only the jobs whose state changed; `status` prints every job once, and `--json` makes it machine readable.
 
-### 終了コード
+## Commands
 
-| コード | 意味 |
-| ---: | --- |
-| 0 | 成功(スキップ・中立は成功扱い) |
-| 1 | 失敗(failure / timed_out / startup_failure / action_required) |
-| 2 | 入力不正・認証・通信・API エラー |
-| 3 | 取消(cancelled / stale) |
-| 4 | `watch` が `--timeout` で打ち切られた |
-| 5 | レート制限で結論を得られなかった |
-| 6 | `status` で対象がまだ実行中・待機中 |
-| 7 | 対象(リポジトリ・コミット・run)が見つからない / run がまだ無い |
+```text
+vigilia watch  [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--interval 20] [--timeout 3600] [--wait-for-runs 120] [--ttl 15] [--no-cache]
+vigilia status [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--json] [--ttl 15] [--no-cache]
+vigilia budget [--json]
+```
 
-複数 suite の結論は 失敗 > 取消 > 成功 の優先順です。
+- The target is a **run id** (9 or more digits) or a **commit SHA** (7 to 40 hex digits, abbreviations allowed). Omitting it or passing `HEAD` uses the current `HEAD`.
+- Without `--repo`, the repository is inferred from the current git remote (`origin` first, github.com only). It is not needed for a run id.
+- With a SHA, Vigilia watches every check suite (workflow) of that commit and concludes once all have finished. When several suites disagree, the result is failure > cancelled > success.
+- `budget` prints the remaining REST, GraphQL and search quota and the reset times, without consuming any.
 
-## `gh run watch` の置き換え
+### Replacing `gh run watch`
 
-| これまで | Vigilia |
+| Before | Vigilia |
 | --- | --- |
 | `gh run watch <run-id> --exit-status` | `vigilia watch <run-id>` |
-| push 直後に最新 run を待つ | `vigilia watch HEAD`(SHA 起点。run が現れるまで `--wait-for-runs` 秒待つ) |
+| Wait for the latest run right after a push | `vigilia watch HEAD` (SHA based; waits up to `--wait-for-runs` seconds for a run to appear) |
 | `gh run view <run-id>` | `vigilia status <run-id>` |
 | `gh api rate_limit` | `vigilia budget` |
 
@@ -87,37 +81,47 @@ $ vigilia watch e8c8bb3
 git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" }
 ```
 
-## レート制限への振る舞い
+### Exit codes
 
-- リクエストは常に直列で、`watch` の取得間隔は 5 秒以上に制限しています。
-- `Retry-After` / `x-ratelimit-reset` を尊重します。`watch` は制限に当たっても落ちず、示された時間だけ待って再開します
-  (`--timeout` を超えそうなら終了コード 5 で返します)。`status` は終了コード 5 で返します。
-- GraphQL の `RATE_LIMITED`(HTTP 200 で返る場合)も同様に扱います。制限中に古いキャッシュがあれば警告付きでそれを返します。
-- 通信エラーと 5xx は最大 3 回、指数バックオフで再試行します。
+| Code | Meaning |
+| ---: | --- |
+| 0 | Success (skipped and neutral count as success) |
+| 1 | Failure (failure / timed_out / startup_failure / action_required) |
+| 2 | Invalid input, authentication, network or API error |
+| 3 | Cancelled (cancelled / stale) |
+| 4 | `watch` stopped by `--timeout` |
+| 5 | Could not reach a conclusion because of rate limiting |
+| 6 | `status`: the target is still running or queued |
+| 7 | The target (repository, commit or run) was not found, or no run exists yet |
 
-## キャッシュ
+## Rate limits
 
-- 場所: Windows `%LOCALAPPDATA%\Vigilia\cache` / macOS `~/Library/Caches/Vigilia/cache` / Linux `$XDG_CACHE_HOME/Vigilia/cache`
-  (環境変数 `VIGILIA_CACHE_DIR` で変更可能)。
-- キー(repo + 対象)ごとに 1 ファイル。一時ファイルへ書いてから rename するため、読み手が壊れた内容を見ることはありません。
-- 完了済み(結論が確定)のスナップショットは最大 5 分間再利用します。`--no-cache` で無効化できます。
-- キャッシュは最適化であり正本ではありません。壊れた・古い・読めないファイルは無視して再取得します。
+- Requests are always sequential, and the `watch` interval is limited to 5 seconds or more.
+- `Retry-After` and `x-ratelimit-reset` are honored. `watch` does not abort when it is rate limited: it waits for the indicated time and resumes (it returns exit code 5 if that would exceed `--timeout`). `status` returns exit code 5.
+- A GraphQL `RATE_LIMITED` error (which arrives with HTTP 200) is handled the same way. While limited, a stale cached snapshot is returned with a warning if one exists.
+- Network errors and 5xx responses are retried up to 3 times with exponential backoff.
 
-## 既知の制約
+## Caching
 
-- run id → run の解決には、GitHub が非推奨としているレガシー形式のグローバル ID(`011:WorkflowRun<id>`)を使います。
-  REST を使わずに run id から引ける経路がこれしかないためです。将来廃止された場合は run id 指定だけが API エラーになります
-  (SHA 指定は影響を受けません)。
-- 1 コミットあたり check suite は 50 件、1 suite あたり check run は 30 件(run id 指定は 50 件)まで取得します。suite が上限を超えて成功に見える場合は成功と断定せずエラー(終了コード 2)にし、job の超過は
-  「一部を省略」と表示します。
-- check run を持たない非 Actions アプリの check suite は、完了しないことがあるため監視対象から除外します。
+- Location: Windows `%LOCALAPPDATA%\Vigilia\cache`, macOS `~/Library/Caches/Vigilia/cache`, Linux `$XDG_CACHE_HOME/Vigilia/cache`. Override it with the `VIGILIA_CACHE_DIR` environment variable.
+- One file per key (repository plus target). Files are written to a temporary file and renamed, so a reader never sees a half-written entry.
+- A finished snapshot (conclusion fixed) is reused for up to 5 minutes. `--no-cache` disables the cache.
+- The cache is an optimization, not a source of truth. Corrupt, outdated or unreadable files are ignored and refetched.
 
-## 開発
+## Limitations
 
-```powershell
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+- Resolving a run id to a run uses the legacy global ID format that GitHub has deprecated (`011:WorkflowRun<id>`), because it is the only way to look up a run by id without REST. If it is removed in the future, only run id targets will fail with an API error; SHA targets are unaffected.
+- At most 50 check suites per commit and 30 check runs per suite (50 for a run id target) are fetched. If suites exceed the limit and everything seen looks successful, Vigilia reports an error (exit code 2) instead of claiming success; exceeding the job limit is shown as partially omitted.
+- Check suites of non-Actions apps that have no check runs may never complete, so they are excluded from watching.
+
+## Development
+
+```sh
+cargo build --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-バージョンは 0.1.0。リリース配信は未整備です。
+## License
+
+[MIT](LICENSE)
