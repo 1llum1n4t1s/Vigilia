@@ -30,10 +30,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 完了まで監視する(成功 0 / 失敗 1 / 取消 3 / タイムアウト 4 / エラー 2 / レート制限 5)
+    /// 完了まで監視する(成功 0 / 失敗 1 / 取消 3 / タイムアウト 4 / エラー 2 / レート制限 5 / 未検出 7)
     Watch(WatchArgs),
     /// 状態を 1 回だけ取得する
     Status(StatusArgs),
+    /// コミット(SHA・HEAD・ブランチ)の workflow run 一覧を表示する(見つからなければ 7)
+    Runs(RunsArgs),
     /// REST / GraphQL / search の残り枠とリセット時刻を表示する(枠は消費しない)
     Budget(BudgetArgs),
 }
@@ -52,6 +54,13 @@ pub struct TargetArgs {
     /// 共有キャッシュを使わず毎回取得する
     #[arg(long)]
     pub no_cache: bool,
+    /// SHA / HEAD 指定のとき、この workflow の run だけで判定する(表示名、
+    /// または `.github/workflows/x.yml` / `x.yml` のパス)。run が現れるまでは待機 / 未検出
+    #[arg(long)]
+    pub workflow: Option<String>,
+    /// SHA / HEAD 指定のとき、このイベント(push / workflow_dispatch など)の run だけで判定する
+    #[arg(long)]
+    pub event: Option<String>,
 }
 
 #[derive(Args)]
@@ -79,6 +88,40 @@ pub struct StatusArgs {
 }
 
 #[derive(Args)]
+pub struct RunsArgs {
+    /// コミット SHA(7〜40 桁)・HEAD・ブランチ名(先頭コミットを解決する)。省略時は HEAD
+    pub target: Option<String>,
+    /// OWNER/REPO。省略時はカレントの git remote から推定
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// この workflow の run だけを出す(表示名、または `.github/workflows/x.yml` / `x.yml`)
+    #[arg(long)]
+    pub workflow: Option<String>,
+    /// このイベント(push / workflow_dispatch など)の run だけを出す
+    #[arg(long)]
+    pub event: Option<String>,
+    /// この時刻(RFC 3339。例: 2026-11-18T09:00:00Z)以後に作成された run だけを出す
+    #[arg(long)]
+    pub since: Option<String>,
+    /// 条件に合う run が現れるまで最大この秒数待つ(0 は待たず 1 回だけ取得)。
+    /// 現れなければ終了コード 7
+    #[arg(long, default_value_t = 0)]
+    pub wait: u64,
+    /// --wait 中の取得間隔(秒、5 以上)
+    #[arg(long, default_value_t = 10)]
+    pub interval: u64,
+    /// キャッシュを新鮮とみなす秒数
+    #[arg(long, default_value_t = 15)]
+    pub ttl: u64,
+    /// 共有キャッシュを使わず毎回取得する
+    #[arg(long)]
+    pub no_cache: bool,
+    /// JSON 配列で出力する(作成時刻の新しい順)
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
 pub struct BudgetArgs {
     /// JSON で出力する
     #[arg(long)]
@@ -90,6 +133,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Watch(a) => commands::watch(&a),
         Command::Status(a) => commands::status(&a),
+        Command::Runs(a) => commands::runs(&a),
         Command::Budget(a) => commands::budget(&a),
     };
     match result {

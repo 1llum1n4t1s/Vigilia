@@ -91,8 +91,9 @@ Command output is in Japanese. `watch` prints only the jobs whose state changed;
 ## Commands
 
 ```text
-vigilia watch  [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--interval 20] [--timeout 3600] [--wait-for-runs 120] [--ttl 15] [--no-cache]
-vigilia status [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--json] [--ttl 15] [--no-cache]
+vigilia watch  [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--workflow <name|file>] [--event <event>] [--interval 20] [--timeout 3600] [--wait-for-runs 120] [--ttl 15] [--no-cache]
+vigilia status [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--workflow <name|file>] [--event <event>] [--json] [--ttl 15] [--no-cache]
+vigilia runs   [<sha | HEAD | branch>] [--repo OWNER/REPO] [--workflow <name|file>] [--event <event>] [--since <RFC3339>] [--wait <secs>] [--interval 10] [--json] [--ttl 15] [--no-cache]
 vigilia budget [--json]
 ```
 
@@ -100,6 +101,32 @@ vigilia budget [--json]
 - Without `--repo`, the repository is inferred from the current git remote (`origin` first, github.com only). It is not needed for a run id.
 - With a SHA, Vigilia watches every check suite (workflow) of that commit and concludes once all have finished. When several suites disagree, the result is failure > cancelled > success.
 - `budget` prints the remaining REST, GraphQL and search quota and the reset times, without consuming any.
+
+### Picking out one workflow (`--workflow` / `--event`)
+
+By default a SHA target waits for **every** workflow of the commit (including Dependabot's). Add `--workflow` to `watch` / `status` to conclude from the runs of one workflow only; `--event` narrows it further (`push`, `workflow_dispatch`, ...). They are only valid for SHA / `HEAD` targets, not for a run id.
+
+- `--workflow` takes the **display name** (`Release`), the **file path** (`.github/workflows/release.yml`) or the **file name** (`release.yml`). Matching is exact and case sensitive; there is no partial match. `--event` is case insensitive.
+- Until a matching run exists, `watch` waits (up to `--wait-for-runs`, then exit 7) and `status` exits 7.
+- **Several matching runs.** Runs are grouped by (workflow, event) and only the **newest** run of each group (by creation time, then run number) counts: an older failed run that was superseded does not hide a newer success. Runs with **different events** (for example one `push` and one `workflow_dispatch` of the same workflow) are separate groups and **all** count, with the usual failure > cancelled > success order; add `--event` to look at only one. A re-run keeps the same run id and increases its attempt, so it is one run.
+- **Ambiguity.** If the value matches more than one distinct workflow (for example two files that share the display name `CI`), `watch` / `status` stop with exit code 2 and list the candidates; specify the file path instead.
+- Dynamic workflows (such as Dependabot Updates) have no file path, so only their display name can select them.
+- The cache stores the whole commit and does not depend on the filters, so sessions using different filters share it safely. A finished commit is reused for up to 5 minutes only when the *filtered* result is finished, so a workflow that has not appeared yet is never hidden by a stale snapshot.
+
+### Listing runs (`runs`)
+
+`vigilia runs` lists the workflow runs of a commit through GraphQL only, replacing `gh run list --commit ... --json ...` (a REST call). The target is a SHA, `HEAD`, or a **branch name** (resolved to its tip commit with the same query, as `refs/heads/<name>`; a run id is not accepted).
+
+```text
+$ vigilia runs abeebf669a1fbb239d7bf537c88293d0b98177af --repo 1llum1n4t1s/Vigilia --workflow release.yml
+1llum1n4t1s/Vigilia @ abeebf6  run 1 件
+  44146220753  成功  Release [.github/workflows/release.yml]  push  2026-11-17T18:17:24Z  release/1.0.1  https://github.com/.../runs/44146220753
+```
+
+- Filters: `--workflow` (same matching as above; a value matching several workflows lists all of them), `--event`, and `--since <RFC 3339>` (runs created at or after that time; a run without a creation time is excluded).
+- `--wait <secs>` waits up to that long for a matching run to appear (default 0: fetch once). It polls every `--interval` seconds (default 10, minimum 5), honors rate-limit waits and shares the cache. If no run appears, the exit code is 7 (and `[]` is printed with `--json`). With one or more runs found, the exit code is 0 whatever their conclusions are; `runs` does not judge success.
+- `--json` prints an array sorted by creation time, newest first (then run id, descending), so it is deterministic. Each element has `run_id`, `run_number`, `run_attempt`, `workflow`, `workflow_path` (null for dynamic workflows), `event`, `status` and `conclusion` (lower case like `gh`: `completed`, `success`, ...; `conclusion` is null while running), `created_at`, `url`, `head_sha` and `branch` (null when not triggered by a branch).
+- `runs` never reuses a finished snapshot for longer than `--ttl`, so a new run or a moved branch tip is picked up.
 
 ### Replacing `gh run watch`
 
@@ -109,6 +136,9 @@ vigilia budget [--json]
 | Wait for the latest run right after a push | `vigilia watch HEAD` (SHA based; waits up to `--wait-for-runs` seconds for a run to appear) |
 | `gh run view <run-id>` | `vigilia status <run-id>` |
 | `gh api rate_limit` | `vigilia budget` |
+| `gh run list --commit <sha> --json databaseId,...` | `vigilia runs <sha> --json` |
+| Poll `gh run list --branch <b> --commit <sha>` until the release workflow's run appears | `vigilia runs <sha> --workflow release.yml --since <time> --wait 120 --json` |
+| Wait only for one workflow | `vigilia watch <sha> --workflow release.yml` |
 
 ```powershell
 git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" }
@@ -125,7 +155,7 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 | 4 | `watch` stopped by `--timeout` |
 | 5 | Could not reach a conclusion because of rate limiting |
 | 6 | `status`: the target is still running or queued |
-| 7 | The target (repository, commit or run) was not found, or no run exists yet |
+| 7 | The target (repository, commit, branch or run) was not found, or no (matching) run exists yet; `runs`: no matching run found |
 
 ## Rate limits
 

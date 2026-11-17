@@ -22,7 +22,8 @@ pub mod exit {
     pub const RATE_LIMITED: i32 = 5;
     /// `status` で対象がまだ実行中・待機中。
     pub const IN_PROGRESS: i32 = 6;
-    /// 対象に紐づく run / check suite が見つからない。
+    /// 対象(リポジトリ・コミット・ブランチ・run)が見つからない、または対象に紐づく
+    /// (`--workflow` / `--event` に合う)run / check suite がまだ無い。`runs` では条件に合う run が無い。
     pub const NOT_FOUND: i32 = 7;
 }
 

@@ -42,8 +42,8 @@ query($owner:String!,$name:String!,$expr:String!){
         checkSuites(first:50){
           pageInfo{hasNextPage}
           nodes{
-            app{name} status conclusion
-            workflowRun{databaseId runNumber event url workflow{name}}
+            app{name} status conclusion branch{name}
+            workflowRun{databaseId runNumber runAttempt createdAt event url workflow{name} file{path}}
             checkRuns(first:30){
               pageInfo{hasNextPage}
               nodes{name status conclusion detailsUrl startedAt completedAt}
@@ -64,8 +64,8 @@ query($id:ID!){
       checkSuite{
         repository{nameWithOwner}
         commit{oid}
-        app{name} status conclusion
-        workflowRun{databaseId runNumber event url workflow{name}}
+        app{name} status conclusion branch{name}
+        workflowRun{databaseId runNumber runAttempt createdAt event url workflow{name} file{path}}
         checkRuns(first:50){
           pageInfo{hasNextPage}
           nodes{name status conclusion detailsUrl startedAt completedAt}
@@ -182,15 +182,18 @@ impl Client {
         target: &Target,
     ) -> Result<Snapshot> {
         match target {
-            Target::Sha(sha) => {
+            // SHA もブランチも、同じクエリの `object(expression:)` で先頭コミットへ解決できる
+            // (ブランチは `refs/heads/<名前>` で曖昧さ(同名タグ)を避ける)。追加の取得は不要。
+            Target::Sha(_) | Target::Branch(_) => {
                 let (owner, name) = repo.ok_or_else(|| {
-                    VigiliaError::Usage("SHA の場合はリポジトリが必要です".into())
+                    VigiliaError::Usage("SHA・ブランチの場合はリポジトリが必要です".into())
                 })?;
+                let expr = target.expression();
                 let v = self.graphql(
                     COMMIT_QUERY,
-                    json!({ "owner": owner, "name": name, "expr": sha }),
+                    json!({ "owner": owner, "name": name, "expr": expr }),
                 )?;
-                model::parse_commit_response(&v, sha)
+                model::parse_commit_response(&v, &expr)
             }
             Target::Run(id) => {
                 let v = self.graphql(RUN_QUERY, json!({ "id": legacy_run_node_id(*id) }))?;

@@ -99,8 +99,9 @@ $ vigilia watch e8c8bb3
 ## コマンド
 
 ```text
-vigilia watch  [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--interval 20] [--timeout 3600] [--wait-for-runs 120] [--ttl 15] [--no-cache]
-vigilia status [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--json] [--ttl 15] [--no-cache]
+vigilia watch  [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--workflow <名前|ファイル>] [--event <イベント>] [--interval 20] [--timeout 3600] [--wait-for-runs 120] [--ttl 15] [--no-cache]
+vigilia status [<run-id | sha | HEAD>] [--repo OWNER/REPO] [--workflow <名前|ファイル>] [--event <イベント>] [--json] [--ttl 15] [--no-cache]
+vigilia runs   [<sha | HEAD | ブランチ>] [--repo OWNER/REPO] [--workflow <名前|ファイル>] [--event <イベント>] [--since <RFC3339>] [--wait <秒>] [--interval 10] [--json] [--ttl 15] [--no-cache]
 vigilia budget [--json]
 ```
 
@@ -110,6 +111,32 @@ vigilia budget [--json]
   複数 suite の結論は 失敗 > 取消 > 成功 の優先順です。
 - `budget` は REST / GraphQL / search の残り枠とリセット時刻を、枠を消費せずに表示します。
 
+### 特定の workflow だけを見る(`--workflow` / `--event`)
+
+SHA 指定は既定でそのコミットの**全 workflow**(Dependabot の run も含む)を待ちます。`watch` / `status` に `--workflow` を付けると、その workflow の run だけで結論を判定します。`--event`(`push` / `workflow_dispatch` など)でさらに絞れます。SHA / `HEAD` 指定のときだけ使え、run id との併用は使用エラーです。
+
+- `--workflow` は**表示名**(`Release`)、**ファイルパス**(`.github/workflows/release.yml`)、**ファイル名**(`release.yml`)のどれでも指定できます。一致は完全一致で大文字小文字を区別し、部分一致はしません。`--event` は大文字小文字を区別しません。
+- 一致する run が現れるまで、`watch` は待機し(`--wait-for-runs` 秒まで。超えたら終了コード 7)、`status` は終了コード 7 で返します。
+- **複数の run が一致する場合**: (workflow, event) の組ごとに**最も新しい run だけ**を結論に使います(作成時刻、同時刻なら run 番号の大きい方)。新しい run に取って代わられた古い失敗は、新しい成功を隠しません。**event が違う run**(同じ workflow の `push` と `workflow_dispatch` など)は別の組として**すべて**結論に含め、失敗 > 取消 > 成功の優先順で畳み込みます。片方だけ見たいときは `--event` を併用します。再実行は run id が同じまま attempt が増えるので 1 つの run です。
+- **曖昧な指定**: 指定値が複数の別 workflow に一致する場合(例: 表示名 `CI` を持つファイルが 2 つ)は、`watch` / `status` は候補を挙げて終了コード 2 で止まります。ファイルパスで指定してください。
+- Dependabot Updates のような動的 workflow はファイルパスを持たないため、表示名でだけ指定できます。
+- キャッシュは「コミット全体」を保存し、絞り込み条件に依存しません。条件違いのセッション同士でも安全に共有できます。完了済みの再利用(最大 5 分)は**絞り込んだ後の結果**が完了しているときだけに限るので、まだ現れていない workflow を古いスナップショットで見逃すことはありません。
+
+### run 一覧(`runs`)
+
+`vigilia runs` は、コミットの workflow run 一覧を GraphQL だけで取得します。`gh run list --commit ... --json ...`(REST を消費する)の代わりに使えます。対象は SHA・`HEAD`・**ブランチ名**です(ブランチは同じクエリで `refs/heads/<名前>` として先頭コミットへ解決します。run id は指定できません)。
+
+```text
+$ vigilia runs abeebf669a1fbb239d7bf537c88293d0b98177af --repo 1llum1n4t1s/Vigilia --workflow release.yml
+1llum1n4t1s/Vigilia @ abeebf6  run 1 件
+  44146220753  成功  Release [.github/workflows/release.yml]  push  2026-11-17T18:17:24Z  release/1.0.1  https://github.com/.../runs/44146220753
+```
+
+- 絞り込み: `--workflow`(一致規則は上と同じ。複数の workflow に一致してもエラーにせず全て出す)、`--event`、`--since <RFC 3339>`(その時刻以後に作成された run。作成時刻が不明な run は除外)。
+- `--wait <秒>` は、条件に合う run が現れるまで最大その秒数待ちます(既定 0 は 1 回だけ取得)。`--interval` 秒ごと(既定 10、5 以上)に取得し、レート制限の待機とキャッシュ共有は `watch` と同じ仕組みです。現れなければ終了コード 7(`--json` では `[]` を出力)。run が 1 件でも見つかれば、結論に関わらず終了コード 0 です(`runs` は成否を判定しません)。
+- `--json` は作成時刻の新しい順(同時刻は run id の大きい順)の配列で、並びは決定的です。要素は `run_id` / `run_number` / `run_attempt` / `workflow` / `workflow_path`(動的 workflow は null)/ `event` / `status` / `conclusion`(`gh` と同じ小文字表記: `completed`・`success` など。実行中の `conclusion` は null)/ `created_at` / `url` / `head_sha` / `branch`(ブランチ起点でなければ null)です。
+- `runs` は完了済みでも `--ttl` を超えてキャッシュを使い回さないため、新しい run やブランチ先頭の移動を拾えます。
+
 ### `gh run watch` の置き換え
 
 | これまで | Vigilia |
@@ -118,6 +145,9 @@ vigilia budget [--json]
 | push 直後に最新 run を待つ | `vigilia watch HEAD`(SHA 起点。run が現れるまで `--wait-for-runs` 秒待つ) |
 | `gh run view <run-id>` | `vigilia status <run-id>` |
 | `gh api rate_limit` | `vigilia budget` |
+| `gh run list --commit <sha> --json databaseId,...` | `vigilia runs <sha> --json` |
+| release workflow の run が現れるまで `gh run list --branch <b> --commit <sha>` を polling | `vigilia runs <sha> --workflow release.yml --since <時刻> --wait 120 --json` |
+| 特定の workflow だけ待つ | `vigilia watch <sha> --workflow release.yml` |
 
 ```powershell
 git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" }
@@ -134,7 +164,7 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 | 4 | `watch` が `--timeout` で打ち切られた |
 | 5 | レート制限で結論を得られなかった |
 | 6 | `status` で対象がまだ実行中・待機中 |
-| 7 | 対象(リポジトリ・コミット・run)が見つからない / run がまだ無い |
+| 7 | 対象(リポジトリ・コミット・ブランチ・run)が見つからない / (条件に合う)run がまだ無い。`runs` では条件に合う run が見つからない |
 
 ## レート制限への振る舞い
 

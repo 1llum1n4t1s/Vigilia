@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### 追加
+
+- `vigilia runs <sha|HEAD|ブランチ>`: コミットの workflow run 一覧(run id・workflow 名とファイルパス・event・状態・作成時刻・URL・ブランチ)を GraphQL だけで表示する。`--workflow` / `--event` / `--since` で絞り込み、`--wait <秒>` で条件に合う run が現れるまで待つ(現れなければ終了コード 7)。`--json` は作成時刻の新しい順の配列。`gh run list`(REST を消費する)の代わりに使える。
+- `vigilia watch` / `vigilia status` に `--workflow <表示名|ファイルパス|ファイル名>` と `--event` を追加。SHA 指定のとき、指定した workflow の run だけで結論を判定する(run が現れるまでは待機 / 未検出)。同じ workflow・event の複数 run は最新だけを使い、event が違う run は全て含める。複数の workflow に一致する指定は使用エラーにする。
+- キャッシュの形式を更新した(旧版のキャッシュは自動的に再取得される)。
+
 ## 1.0.1 - 2026-11-18
 
 ### 追加

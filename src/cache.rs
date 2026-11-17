@@ -40,7 +40,8 @@ pub struct Entry {
     pub snapshot: Snapshot,
 }
 
-const ENTRY_VERSION: u32 = 1;
+/// v2: `Suite` に workflow_path / created_at / run_attempt / branch を追加(runs の絞り込みに必要)。
+const ENTRY_VERSION: u32 = 2;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -56,12 +57,25 @@ impl Entry {
     }
 
     /// `ttl` 以内、または完了済みで `TERMINAL_TTL` 以内なら新鮮とみなす。
+    #[cfg(test)]
     pub fn is_fresh(&self, now_ms: u64, ttl: Duration) -> bool {
+        self.is_fresh_with(now_ms, ttl, &|s| s.overall().is_terminal())
+    }
+
+    /// `is_fresh` の一般形。「完了済みとみなして TERMINAL_TTL まで再利用してよいか」を
+    /// 呼び出し側が決める。workflow で絞った監視や `runs` では、絞る前の全体が完了していても
+    /// 「待っている run がまだ現れていない」だけの場合があり、古い結果を使い回すと見逃すため。
+    pub fn is_fresh_with(
+        &self,
+        now_ms: u64,
+        ttl: Duration,
+        terminal: &dyn Fn(&Snapshot) -> bool,
+    ) -> bool {
         let age = self.age(now_ms);
         if age <= ttl {
             return true;
         }
-        self.snapshot.overall().is_terminal() && age <= TERMINAL_TTL.max(ttl)
+        terminal(&self.snapshot) && age <= TERMINAL_TTL.max(ttl)
     }
 }
 
@@ -202,16 +216,17 @@ impl Cache {
         &self,
         key: &str,
         ttl: Duration,
+        terminal: &dyn Fn(&Snapshot) -> bool,
     ) -> (Option<Entry>, Option<LockGuard>) {
         if let Some(e) = self.read(key)
-            && e.is_fresh(now_ms(), ttl)
+            && e.is_fresh_with(now_ms(), ttl, terminal)
         {
             return (Some(e), None);
         }
         if let Some(guard) = self.try_lock(key) {
             // ロック取得の間に他セッションが書き込んだ可能性があるため再確認(ダブルチェック)。
             if let Some(e) = self.read(key)
-                && e.is_fresh(now_ms(), ttl)
+                && e.is_fresh_with(now_ms(), ttl, terminal)
             {
                 return (Some(e), None);
             }
@@ -222,7 +237,7 @@ impl Cache {
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(250));
             if let Some(e) = self.read(key)
-                && e.is_fresh(now_ms(), ttl)
+                && e.is_fresh_with(now_ms(), ttl, terminal)
             {
                 return (Some(e), None);
             }
@@ -274,6 +289,7 @@ mod tests {
                 status: status.into(),
                 conclusion: conclusion.map(String::from),
                 jobs: vec![],
+                ..Default::default()
             }],
             truncated: false,
             suites_truncated: false,
@@ -349,12 +365,12 @@ mod tests {
     fn 新鮮ならロックせずキャッシュを返す() {
         let c = Cache::new(test_dir("fresh")).unwrap();
         c.write("k", &snap("IN_PROGRESS", None)).unwrap();
-        let (hit, guard) = c.get_or_lock("k", Duration::from_secs(15));
+        let (hit, guard) = c.get_or_lock("k", Duration::from_secs(15), &|s| s.overall().is_terminal());
         assert!(hit.is_some());
         assert!(guard.is_none());
         // 古い(ttl=0)場合はロック付きで取得を促す。
         std::thread::sleep(Duration::from_millis(5));
-        let (hit, guard) = c.get_or_lock("k", Duration::from_millis(0));
+        let (hit, guard) = c.get_or_lock("k", Duration::from_millis(0), &|s| s.overall().is_terminal());
         assert!(hit.is_none());
         assert!(guard.is_some());
     }

@@ -39,22 +39,22 @@ cargo clippy --locked --all-targets -- -D warnings
 | ファイル | 責務 |
 | --- | --- |
 | `main.rs` | clap の引数定義と `main`。エラーを終了コードへ変換する |
-| `commands.rs` | `watch` / `status` / `budget` の実装 |
-| `service.rs` | `Resolver`。キャッシュ → GraphQL の取得を1か所に集約 |
+| `commands.rs` | `watch` / `status` / `runs` / `budget` の実装 |
+| `service.rs` | `Resolver`。キャッシュ → GraphQL の取得を1か所に集約(`Freshness` で完了済みの再利用方針を切り替える) |
 | `cache.rs` | ファイルキャッシュ・ロック |
 | `github.rs` | GraphQL / `GET /rate_limit` クライアント、トークン取得、HTTP エラー分類 |
-| `model.rs` | `Snapshot` と結論（`Overall`）の判定、GraphQL 応答の正規化 |
-| `target.rs` | 対象（run id / SHA / HEAD）と repo の解釈・推定 |
+| `model.rs` | `Snapshot` と結論（`Overall`）の判定、GraphQL 応答の正規化、workflow / event の絞り込み(`RunFilter`)と run 一覧(`RunInfo`) |
+| `target.rs` | 対象（run id / SHA / HEAD / ブランチ(`runs` のみ)）と repo の解釈・推定 |
 | `render.rs` | 表示用の整形 |
 | `error.rs` | `VigiliaError` と終了コード |
 
 ## 守るべき制約
 
 - **REST の枠を消費しない。** CI 状態の取得は GraphQL（`POST /graphql`）のみ。使ってよい REST は枠を消費しない `GET /rate_limit` だけ。REST 経由の取得を足さない。
-- **リクエストは直列。** 並列化しない。`watch` の `--interval` は 5 秒未満を拒否する（`commands.rs` の `MIN_INTERVAL_SECS`）。
+- **リクエストは直列。** 並列化しない。`watch` と `runs --wait` の `--interval` は 5 秒未満を拒否する（`commands.rs` の `MIN_INTERVAL_SECS`）。
 - **トークンを出さない。** `GH_TOKEN` / `GITHUB_TOKEN` → `gh auth token` の順で取得し、ログ・エラー文・出力・キャッシュへ書かない。
 - **終了コードの表は3か所を揃える。** `error.rs` の `exit`、`main.rs` の `watch` の doc コメント、README の表。コードを変えたら全て更新する。
-- **結論の規則は `model.rs` に集約する。** `watch` と `status` は同じ `conclusive_overall()` を使う。suite が切り捨てられた状態で「成功」と断定しない（エラーにする）。
+- **結論の規則は `model.rs` に集約する。** `watch` と `status` は同じ `conclusive_overall()` を使う。suite が切り捨てられた状態で「成功」と断定しない（エラーにする）。`--workflow` / `--event` の絞り込み（複数一致の規則を含む）も `Snapshot::filtered()` に置き、取得後に適用する（キャッシュのキーに条件を入れない）。
 - **キャッシュは最適化であり正本ではない。** 読めない・壊れた・版違いは「なし」として扱い、書き込みは一時ファイル → rename。`cache.rs` の `ENTRY_VERSION` は `Snapshot` の形式を非互換に変えたときに上げる。
 - **ユーザー向け文言・コードコメントは日本語。** 既存の書き方に合わせる。
 

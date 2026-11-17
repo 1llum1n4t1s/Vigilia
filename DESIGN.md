@@ -14,9 +14,9 @@ Vigilia の設計。使い方は [README.md](README.md)、開発規約は [AGENT
 ## 構成と責務
 
 ```text
-main.rs ─ clap 引数 → commands.rs (watch / status / budget)
+main.rs ─ clap 引数 → commands.rs (watch / status / runs / budget)
                           │
-                          ├─ target.rs   対象と repo の解釈（run id / SHA / HEAD、git remote 推定）
+                          ├─ target.rs   対象と repo の解釈（run id / SHA / HEAD / ブランチ(runs のみ)、git remote 推定）
                           ├─ service.rs  Resolver: キャッシュ → GraphQL の取得を1か所に集約
                           │     ├─ cache.rs   ファイルキャッシュ + ロック
                           │     └─ github.rs  GraphQL / rate_limit クライアント、トークン、HTTP エラー分類
@@ -40,12 +40,22 @@ error.rs: VigiliaError と終了コード（全層で共有）
 4. `Snapshot::overall()` が全 suite を畳み込んで結論を出し、`commands.rs` が終了コードに変換する。
 5. `watch` は `--interval` ごとに 1〜4 を繰り返し、状態が変わった job だけを出力し、結論が確定したら終了する。
 
-クエリは2種類。SHA 起点は `repository.object(expression)` から `checkSuites(first:50)` と各 `checkRuns(first:30)`、run id 起点は `node(id)` から `checkSuite` と `checkRuns(first:50)`。
+クエリは2種類。SHA 起点は `repository.object(expression)` から `checkSuites(first:50)` と各 `checkRuns(first:30)`、run id 起点は `node(id)` から `checkSuite` と `checkRuns(first:50)`。どちらも各 suite から `branch{name}`、`workflowRun{databaseId runNumber runAttempt createdAt event url workflow{name} file{path}}` を取る（`runs` と `--workflow` に必要な分。追加は connection ではなくスカラー / 単一オブジェクトなので cost は 1 のまま）。
+
+### `runs` と `--workflow` / `--event`
+
+追加クエリは作らず、既存の SHA 起点クエリ・キャッシュ・待機の仕組みをそのまま使う。
+- **ブランチ指定**は `object(expression: "refs/heads/<名前>")` で先頭コミットへ解決する（同名タグとの衝突を避けるため完全な ref 名にする）。`Target::Branch` はこのクエリ用で、`watch` / `status` は受け付けない。
+- **絞り込みは取得の後**に `Snapshot` へ適用する（`model.rs` の `RunFilter` / `Snapshot::filtered()` / `Snapshot::runs()`）。キャッシュのキーに条件を含めないので、条件違いのセッションが同じ取得結果を安全に共有できる。ブランチのキーだけは、ファイル名で `/` と `_` が潰れて衝突しないようハッシュを添える。
+- **完了済みの再利用は `Freshness` で決める。** 絞る前の全体が完了済みでも、待っている run が未出現なだけの場合があるため、`Filtered` は「絞った後の結論が確定したとき」だけ `TERMINAL_TTL` を適用する。`runs`（`Strict`）は新しい run・ブランチ先頭の移動を拾うため `TERMINAL_TTL` を適用しない。
+- **複数一致の規則**（`Snapshot::filtered`）: 指定が複数の別 workflow に一致したら使用エラー（終了コード 2）。同じ (workflow, event) の run は最新の 1 件だけを結論に使う（再実行・重複 push で古い失敗が新しい成功を隠さない）。event が違う run は別物として全て含める。`runs` は一致した run を全て列挙する。
+- **workflow の一致**は、表示名・ファイルパス・ファイル名のいずれかと完全一致（大文字小文字を区別）。動的 workflow（Dependabot Updates など）はパスを持たないので表示名だけで指定できる。
+- **`runs --wait`** は `watch` と同じ最小間隔（5 秒）・レート制限待機・古いキャッシュ時の待機を使い、現れなければ終了コード 7。`runs` は結論を判定せず、run が 1 件でもあれば 0。
 
 ## 不変条件
 
 - **REST の枠を消費しない。** 使う HTTP は `POST /graphql` と、枠を消費しない `GET /rate_limit` だけ。REST の枠が 0 でも動く。
-- **リクエストは直列で、`watch` の間隔は 5 秒以上。** 二次レート制限（短時間の同時接続・過剰頻度）を避ける。
+- **リクエストは直列で、`watch` と `runs --wait` の間隔は 5 秒以上。** 二次レート制限（短時間の同時接続・過剰頻度）を避ける。
 - **トークンを出さない。** `GH_TOKEN` / `GITHUB_TOKEN`、なければ `gh auth token`。メモリ内のみで保持し、ログ・エラー・出力・キャッシュに書かない。reqwest のエラーは URL を除いて表示する。
 - **結論の規則は1か所。** 未完了の suite が1つでもあれば実行中、全完了なら 失敗 > 取消 > 成功。失敗は FAILURE / TIMED_OUT / STARTUP_FAILURE / ACTION_REQUIRED、取消は CANCELLED / STALE。スキップ・中立は成功扱い。
 - **切り捨てた状態で成功と断定しない。** suite が上限（50）を超えて切り捨てられ、かつ結論が「成功」のときは、取りこぼした suite が失敗している可能性があるためエラー（終了コード 2）にする。job の切り捨ては表示上の注意に留める（suite の結論は GitHub が集計済みのため）。

@@ -2,12 +2,12 @@
 
 use crate::error::{Result, VigiliaError, exit};
 use crate::github::{Client, Resource};
-use crate::model::{Overall, Snapshot};
+use crate::model::{Overall, RunFilter, RunInfo, Snapshot};
 use crate::render;
-use crate::service::{Fetched, Resolver, Source};
+use crate::service::{Fetched, Freshness, Resolver, Source};
 use crate::target::{self, Target};
-use crate::{BudgetArgs, StatusArgs, TargetArgs, WatchArgs};
-use chrono::{Local, Utc};
+use crate::{BudgetArgs, RunsArgs, StatusArgs, TargetArgs, WatchArgs};
+use chrono::{DateTime, Local, Utc};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -18,18 +18,47 @@ const MIN_INTERVAL_SECS: u64 = 5;
 /// 引数から (repo, target) を確定し、Resolver を作る。
 fn build_resolver(a: &TargetArgs) -> Result<Resolver> {
     let target = target::parse_target(a.target.as_deref().unwrap_or("HEAD"))?;
+    let filter = RunFilter {
+        workflow: a.workflow.clone(),
+        event: a.event.clone(),
+        since: None,
+    };
+    if matches!(target, Target::Run(_)) && !filter.is_unfiltered() {
+        return Err(VigiliaError::Usage(
+            "--workflow / --event は SHA・HEAD 指定のときだけ使えます(run id は 1 つの run を指すため)"
+                .into(),
+        ));
+    }
     let repo = match (&a.repo, &target) {
         (Some(r), _) => Some(target::parse_repo(r)?),
         // run id は repo 不要(run から逆引きできる)。省略時は推定しない。
         (None, Target::Run(_)) => None,
-        (None, Target::Sha(_)) => Some(target::infer_repo()?),
+        (None, _) => Some(target::infer_repo()?),
+    };
+    let freshness = if filter.is_unfiltered() {
+        Freshness::Default
+    } else {
+        Freshness::Filtered(filter)
     };
     Ok(Resolver::new(
         repo,
         target,
         !a.no_cache,
         Duration::from_secs(a.ttl),
+        freshness,
     ))
+}
+
+/// 絞り込み条件の表示用ラベル(例: `workflow=release.yml, event=push`)。無ければ None。
+fn filter_label(a: &TargetArgs) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(w) = &a.workflow {
+        parts.push(format!("workflow={w}"));
+    }
+    if let Some(e) = &a.event {
+        parts.push(format!("event={e}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// レート制限時の待ち時間。示された時間を尊重しつつ、`--interval` より短くはしない。
@@ -61,10 +90,14 @@ pub fn status(a: &StatusArgs) -> Result<i32> {
             "overall": overall,
             "source": fetched.source.as_str(),
             "age_secs": fetched.age.as_secs(),
+            "filter": { "workflow": a.target.workflow, "event": a.target.event },
             "snapshot": fetched.snapshot,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     } else {
+        if let Some(l) = filter_label(&a.target) {
+            println!("絞り込み: {l}");
+        }
         print!("{}", render::render_snapshot(&fetched.snapshot, Utc::now()));
         println!("{}", source_line(&fetched));
     }
@@ -87,6 +120,118 @@ fn source_line(f: &Fetched) -> String {
             c.cost, c.remaining, c.reset_at
         ),
         _ => format!("[{src}]"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// runs
+// ---------------------------------------------------------------------------
+
+/// `--since` を RFC 3339 として解釈する。
+fn parse_since(s: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s.trim())
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| {
+            VigiliaError::Usage(format!(
+                "--since は RFC 3339 形式で指定してください(例: 2026-11-18T09:00:00Z): {e}"
+            ))
+        })
+}
+
+pub fn runs(a: &RunsArgs) -> Result<i32> {
+    if a.interval < MIN_INTERVAL_SECS {
+        return Err(VigiliaError::Usage(format!(
+            "--interval は {MIN_INTERVAL_SECS} 秒以上にしてください(API 負荷と二次レート制限の回避のため)"
+        )));
+    }
+    let target = target::parse_runs_target(a.target.as_deref().unwrap_or("HEAD"))?;
+    let repo = match &a.repo {
+        Some(r) => target::parse_repo(r)?,
+        None => target::infer_repo()?,
+    };
+    let filter = RunFilter {
+        workflow: a.workflow.clone(),
+        event: a.event.clone(),
+        since: a.since.as_deref().map(parse_since).transpose()?,
+    };
+    // runs は「新しい run が現れたか」を見るため、完了済みでも長くキャッシュしない(Strict)。
+    let mut resolver = Resolver::new(
+        Some(repo),
+        target,
+        !a.no_cache,
+        Duration::from_secs(a.ttl),
+        Freshness::Strict,
+    );
+    let started = Instant::now();
+    let wait = Duration::from_secs(a.wait);
+    let interval = Duration::from_secs(a.interval);
+
+    loop {
+        match resolver.get() {
+            Ok(f) => {
+                let found = f.snapshot.runs(&filter);
+                let stale = f.source == Source::StaleCache;
+                if !found.is_empty() {
+                    if stale {
+                        eprintln!(
+                            "警告: レート制限のため古いキャッシュ({}秒前)の結果です",
+                            f.age.as_secs()
+                        );
+                    }
+                    print_runs(&f, &found, a.json);
+                    return Ok(exit::SUCCESS);
+                }
+                if stale {
+                    // 古いキャッシュで「無い」とは断定できない。示された時間だけ待って再取得する。
+                    let w = rate_wait(interval, f.retry_after);
+                    if started.elapsed() + w >= wait {
+                        return Err(VigiliaError::RateLimited {
+                            retry_after: f.retry_after,
+                            message: "古いキャッシュのまま --wait に達します".into(),
+                        });
+                    }
+                    eprintln!("レート制限中: {}秒待機して再開します", w.as_secs());
+                    std::thread::sleep(w);
+                    continue;
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= wait {
+                    if a.json {
+                        println!("[]");
+                    }
+                    eprintln!(
+                        "条件に合う run は見つかりませんでした({} @ {}{})",
+                        f.snapshot.repo,
+                        render::short_sha(&f.snapshot.sha),
+                        if f.snapshot.suites_truncated {
+                            "。check suite が多く一部を取得していません"
+                        } else {
+                            ""
+                        }
+                    );
+                    return Ok(exit::NOT_FOUND);
+                }
+                std::thread::sleep(interval.min(wait - elapsed));
+            }
+            Err(VigiliaError::RateLimited { retry_after, message }) => {
+                let w = rate_wait(interval, retry_after);
+                if started.elapsed() + w >= wait {
+                    return Err(VigiliaError::RateLimited { retry_after, message });
+                }
+                eprintln!("レート制限({message}): {}秒待機して再開します", w.as_secs());
+                std::thread::sleep(w);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn print_runs(f: &Fetched, runs: &[RunInfo], json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(runs).unwrap_or_default());
+    } else {
+        print!("{}", render::render_runs(&f.snapshot.repo, &f.snapshot.sha, runs));
+        println!("{}", source_line(f));
     }
 }
 
@@ -123,8 +268,11 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
                     stale_warned = true;
                 }
                 if !header_printed && !f.snapshot.suites.is_empty() {
+                    let flt = filter_label(&a.target)
+                        .map(|l| format!("({l})"))
+                        .unwrap_or_default();
                     println!(
-                        "{} @ {} を監視します",
+                        "{} @ {} を監視します{flt}",
                         f.snapshot.repo,
                         render::short_sha(&f.snapshot.sha)
                     );
@@ -140,7 +288,7 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
                     && started.elapsed() >= Duration::from_secs(a.wait_for_runs)
                 {
                     return Err(VigiliaError::NotFound(format!(
-                        "{}秒待っても run が現れませんでした(ワークフローが無い/対象外の可能性)",
+                        "{}秒待っても run が現れませんでした(ワークフローが無い/対象外、または絞り込み条件に合う run が無い可能性)",
                         a.wait_for_runs
                     )));
                 }

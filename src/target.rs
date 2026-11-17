@@ -10,6 +10,51 @@ pub enum Target {
     Run(u64),
     /// コミット SHA(短縮可。小文字へ正規化済み)。
     Sha(String),
+    /// ブランチ名(`runs` 専用。先頭コミットを GraphQL で解決する)。
+    Branch(String),
+}
+
+impl Target {
+    /// GraphQL の `object(expression:)` に渡す式。ブランチは同名タグと衝突しないよう
+    /// 完全な ref 名にする。
+    pub fn expression(&self) -> String {
+        match self {
+            Target::Sha(s) => s.clone(),
+            Target::Branch(b) if b.starts_with("refs/") => b.clone(),
+            Target::Branch(b) => format!("refs/heads/{b}"),
+            Target::Run(id) => id.to_string(),
+        }
+    }
+}
+
+/// `runs` 用の対象解釈。`HEAD`・SHA・ブランチ名を受け付け、run id は受け付けない。
+/// SHA として読める文字列(16 進 7〜40 桁)は SHA を優先する。
+pub fn parse_runs_target(input: &str) -> Result<Target> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err(VigiliaError::Usage("対象が空です".into()));
+    }
+    if s.eq_ignore_ascii_case("HEAD") {
+        return resolve_head();
+    }
+    match classify(s) {
+        Ok(Target::Run(_)) => Err(VigiliaError::Usage(
+            "runs は run id を指定できません。コミット SHA・HEAD・ブランチ名を指定してください".into(),
+        )),
+        Ok(t) => Ok(t),
+        Err(_) => {
+            // git の ref 名として明らかに不正なものだけ弾く(最終的な解決は GitHub が行う)。
+            let bad = s.starts_with('-')
+                || s.contains("..")
+                || s.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c));
+            if bad {
+                return Err(VigiliaError::Usage(format!(
+                    "対象 '{s}' を解釈できません。SHA・HEAD・ブランチ名を指定してください"
+                )));
+            }
+            Ok(Target::Branch(s.to_string()))
+        }
+    }
 }
 
 /// 数字のみで 9 桁以上なら run id とみなす。
@@ -171,5 +216,36 @@ mod tests {
         assert_eq!(parse_github_remote("ssh://git@github.com:22/o/r.git"), want);
         assert_eq!(parse_github_remote("https://gitlab.com/o/r.git"), None);
         assert_eq!(parse_github_remote("not a url"), None);
+    }
+
+    #[test]
+    fn runs対象はshaとブランチを受け付けrun_idは拒否する() {
+        assert_eq!(
+            parse_runs_target("E8C8BB3").unwrap(),
+            Target::Sha("e8c8bb3".into())
+        );
+        assert_eq!(
+            parse_runs_target("release/1.0.1").unwrap(),
+            Target::Branch("release/1.0.1".into())
+        );
+        assert_eq!(parse_runs_target("main").unwrap(), Target::Branch("main".into()));
+        assert!(parse_runs_target("43778559656").is_err());
+        assert!(parse_runs_target("-x").is_err());
+        assert!(parse_runs_target("a..b").is_err());
+        assert!(parse_runs_target("a b").is_err());
+        assert!(parse_runs_target("").is_err());
+    }
+
+    #[test]
+    fn ブランチは完全なref名で解決する() {
+        assert_eq!(
+            Target::Branch("main".into()).expression(),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            Target::Branch("refs/heads/x".into()).expression(),
+            "refs/heads/x"
+        );
+        assert_eq!(Target::Sha("abc1234".into()).expression(), "abc1234");
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 標準出力は AI エージェントも読むため、1 job = 1 行、装飾なしを基本にする。
 
-use crate::model::{Job, Snapshot, Suite};
+use crate::model::{Job, RunInfo, Snapshot, Suite};
 use chrono::{DateTime, Local, Utc};
 
 /// status / conclusion を日本語の短いラベルにする。
@@ -100,6 +100,30 @@ pub fn render_snapshot(snap: &Snapshot, now: DateTime<Utc>) -> String {
     out
 }
 
+/// `runs` の人間向け表示。1 run = 1 行(列: run id / 状態 / workflow / event / 作成時刻 / ブランチ / URL)。
+pub fn render_runs(repo: &str, sha: &str, runs: &[RunInfo]) -> String {
+    let mut out = format!("{repo} @ {}  run {} 件\n", short_sha(sha), runs.len());
+    let dash = |o: &Option<String>| o.clone().unwrap_or_else(|| "-".into());
+    for r in runs {
+        let label = state_label(
+            &r.status.to_ascii_uppercase(),
+            r.conclusion.as_deref().map(str::to_ascii_uppercase).as_deref(),
+        );
+        out.push_str(&format!(
+            "  {}  {:<8}  {} [{}]  {}  {}  {}  {}\n",
+            r.run_id,
+            label,
+            dash(&r.workflow),
+            dash(&r.workflow_path),
+            dash(&r.event),
+            dash(&r.created_at),
+            dash(&r.branch),
+            dash(&r.url),
+        ));
+    }
+    out
+}
+
 /// 失敗 job の一覧(`watch` の最終出力用)。
 pub fn failed_jobs(snap: &Snapshot) -> Vec<String> {
     let mut v = Vec::new();
@@ -163,5 +187,27 @@ mod tests {
     fn 短縮sha() {
         assert_eq!(short_sha("e8c8bb3a2eb9"), "e8c8bb3");
         assert_eq!(short_sha("abc"), "abc");
+    }
+
+    #[test]
+    fn run一覧の整形() {
+        let r = RunInfo {
+            run_id: 5,
+            run_number: Some(1),
+            run_attempt: Some(1),
+            workflow: Some("Release".into()),
+            workflow_path: None,
+            event: Some("push".into()),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            created_at: Some("2026-11-17T18:17:24Z".into()),
+            url: None,
+            head_sha: "abcdef0123".into(),
+            branch: None,
+        };
+        let out = render_runs("o/r", "abcdef0123", &[r]);
+        assert!(out.starts_with("o/r @ abcdef0  run 1 件\n"), "{out}");
+        assert!(out.contains("5  失敗"), "{out}");
+        assert!(out.contains("Release [-]  push  2026-11-17T18:17:24Z  -  -"), "{out}");
     }
 }

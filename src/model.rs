@@ -6,6 +6,7 @@
 //! - 「結論(Overall)」の判定はここに集約し、`watch` と `status` で同じ規則を使う。
 
 use crate::error::{Result, VigiliaError};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// 1 回の取得で得られた CI 状態の断面。キャッシュにそのまま保存する。
@@ -26,13 +27,25 @@ pub struct Snapshot {
     pub cost: Option<CostInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Suite {
     pub app: String,
     pub workflow: Option<String>,
+    /// workflow ファイルのパス(例: `.github/workflows/release.yml`)。取得できなければ None。
+    #[serde(default)]
+    pub workflow_path: Option<String>,
     pub run_id: Option<u64>,
     pub run_number: Option<u64>,
+    /// 再実行の通番(初回は 1)。
+    #[serde(default)]
+    pub run_attempt: Option<u64>,
     pub event: Option<String>,
+    /// run の作成時刻(RFC 3339、UTC)。
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// run を起こしたブランチ名(タグ起点などでは None)。
+    #[serde(default)]
+    pub branch: Option<String>,
     pub url: Option<String>,
     /// GraphQL の CheckStatusState(大文字: QUEUED / IN_PROGRESS / COMPLETED ...)。
     pub status: String,
@@ -135,6 +148,203 @@ impl Snapshot {
 }
 
 // ---------------------------------------------------------------------------
+// workflow / event による絞り込みと run 一覧
+// ---------------------------------------------------------------------------
+
+/// run の絞り込み条件。`watch` / `status` は workflow と event、`runs` は since も使う。
+///
+/// 絞り込みは取得(GraphQL・キャッシュ)の後に `Snapshot` へ適用する。したがってキャッシュは
+/// 条件に依存せず、条件違いのセッション同士でも安全に共有できる。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunFilter {
+    /// workflow の表示名、またはファイルパス(`.github/workflows/x.yml` / `x.yml`)。
+    pub workflow: Option<String>,
+    /// イベント名(`push` / `workflow_dispatch` など。大文字小文字は区別しない)。
+    pub event: Option<String>,
+    /// この時刻以後に作成された run だけ(`runs` 専用)。
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// パスの末尾(ファイル名)。
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+impl RunFilter {
+    /// workflow / event のどちらも指定されていない(since は含めない)。
+    pub fn is_unfiltered(&self) -> bool {
+        self.workflow.is_none() && self.event.is_none()
+    }
+
+    /// workflow の一致規則: 指定値が、表示名・ファイルパス全体・ファイル名のいずれかと完全一致する。
+    /// 大文字小文字は区別する(GitHub のファイル名・表示名の扱いに合わせる)。
+    fn workflow_matches(&self, suite: &Suite) -> bool {
+        let Some(spec) = self.workflow.as_deref() else {
+            return true;
+        };
+        suite.workflow.as_deref() == Some(spec)
+            || suite.workflow_path.as_deref() == Some(spec)
+            || suite.workflow_path.as_deref().map(file_name) == Some(spec)
+    }
+
+    /// 1 つの suite(= workflow run)が条件に合うか。workflow run を持たない suite は常に不一致。
+    pub fn matches(&self, suite: &Suite) -> bool {
+        if suite.run_id.is_none() || !self.workflow_matches(suite) {
+            return false;
+        }
+        if let Some(ev) = &self.event
+            && !suite
+                .event
+                .as_deref()
+                .is_some_and(|e| e.eq_ignore_ascii_case(ev))
+        {
+            return false;
+        }
+        if let Some(since) = self.since {
+            let created = suite
+                .created_at
+                .as_deref()
+                .and_then(|c| DateTime::parse_from_rfc3339(c).ok());
+            // 作成時刻が分からない run は「以後」と断定できないため除外する。
+            if !created.is_some_and(|c| c.with_timezone(&Utc) >= since) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// workflow を一意に見分けるキー(パス優先、無ければ表示名)。
+fn workflow_identity(s: &Suite) -> String {
+    s.workflow_path
+        .clone()
+        .or_else(|| s.workflow.clone())
+        .unwrap_or_default()
+}
+
+/// 「どちらが新しい run か」の比較キー(作成時刻 → run 番号 → run id)。
+fn recency(s: &Suite) -> (String, u64, u64) {
+    (
+        s.created_at.clone().unwrap_or_default(),
+        s.run_number.unwrap_or(0),
+        s.run_id.unwrap_or(0),
+    )
+}
+
+impl Snapshot {
+    /// workflow / event で絞った `Snapshot` を返す(`watch` / `status` の `--workflow` / `--event`)。
+    ///
+    /// 複数一致時の規則:
+    /// 1. 指定した workflow が複数の別 workflow に一致する(例: 表示名 `CI` を持つ 2 つのファイル)
+    ///    場合は、どれを指すか決められないため使用エラーにする。
+    /// 2. 同じ workflow・同じ event の run が複数ある(再実行で新しい run が作られた、
+    ///    同じコミットへ同じ push が重なった等)場合は、最も新しい run だけを結論に使う。
+    ///    古い run は新しい run に取って代わられたものとして扱う。
+    /// 3. event が異なる run(push と workflow_dispatch など)は別物として全て結論に含める。
+    ///    片方だけを見たいときは `--event` を併用する。
+    ///
+    /// 一致する run が無ければ suite は空になり、結論は `NoRuns`(待機 / 未検出)になる。
+    pub fn filtered(&self, filter: &RunFilter) -> Result<Snapshot> {
+        let matched: Vec<&Suite> = self.suites.iter().filter(|s| filter.matches(s)).collect();
+        if let Some(spec) = &filter.workflow {
+            let mut ids: Vec<String> = matched.iter().map(|s| workflow_identity(s)).collect();
+            ids.sort();
+            ids.dedup();
+            if ids.len() > 1 {
+                return Err(VigiliaError::Usage(format!(
+                    "--workflow '{spec}' が複数の workflow に一致します: {}。\
+                     ファイルパス(例: .github/workflows/ci.yml)で指定してください",
+                    ids.join(", ")
+                )));
+            }
+        }
+        // (workflow, event) ごとに最新の 1 件だけを残す。元の並びは保つ。
+        let mut latest: std::collections::HashMap<(String, String), (String, u64, u64)> =
+            std::collections::HashMap::new();
+        for s in &matched {
+            let key = (workflow_identity(s), s.event.clone().unwrap_or_default());
+            let r = recency(s);
+            latest
+                .entry(key)
+                .and_modify(|cur| {
+                    if r > *cur {
+                        *cur = r.clone();
+                    }
+                })
+                .or_insert(r);
+        }
+        let suites: Vec<Suite> = matched
+            .into_iter()
+            .filter(|s| {
+                let key = (workflow_identity(s), s.event.clone().unwrap_or_default());
+                latest.get(&key) == Some(&recency(s))
+            })
+            .cloned()
+            .collect();
+        Ok(Snapshot {
+            suites,
+            ..self.clone()
+        })
+    }
+}
+
+/// `runs` が出力する 1 件の workflow run。`--json` の要素そのもの。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunInfo {
+    /// run id(REST の `databaseId` と同じ)。
+    pub run_id: u64,
+    pub run_number: Option<u64>,
+    pub run_attempt: Option<u64>,
+    /// workflow の表示名。
+    pub workflow: Option<String>,
+    /// workflow ファイルのパス。
+    pub workflow_path: Option<String>,
+    pub event: Option<String>,
+    /// 小文字の状態(`queued` / `in_progress` / `completed` など。`gh run list` と同じ表記)。
+    pub status: String,
+    /// 小文字の結論(`success` / `failure` など)。未完了なら null。
+    pub conclusion: Option<String>,
+    pub created_at: Option<String>,
+    pub url: Option<String>,
+    pub head_sha: String,
+    pub branch: Option<String>,
+}
+
+impl Snapshot {
+    /// 条件に合う run の一覧。作成時刻の新しい順(同時刻は run id の大きい順)で決定的に並べる。
+    /// workflow が複数に一致しても全て返す(絞り込みの曖昧さをエラーにするのは結論を出す側だけ)。
+    pub fn runs(&self, filter: &RunFilter) -> Vec<RunInfo> {
+        let mut v: Vec<RunInfo> = self
+            .suites
+            .iter()
+            .filter(|s| filter.matches(s))
+            .filter_map(|s| {
+                Some(RunInfo {
+                    run_id: s.run_id?,
+                    run_number: s.run_number,
+                    run_attempt: s.run_attempt,
+                    workflow: s.workflow.clone(),
+                    workflow_path: s.workflow_path.clone(),
+                    event: s.event.clone(),
+                    status: s.status.to_ascii_lowercase(),
+                    conclusion: s.conclusion.as_ref().map(|c| c.to_ascii_lowercase()),
+                    created_at: s.created_at.clone(),
+                    url: s.url.clone(),
+                    head_sha: self.sha.clone(),
+                    branch: s.branch.clone(),
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.run_id.cmp(&a.run_id))
+        });
+        v
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GraphQL 生レスポンス
 // ---------------------------------------------------------------------------
 
@@ -229,11 +439,22 @@ struct RawSuite {
     workflow_run: Option<RawRun>,
     #[serde(rename = "checkRuns")]
     check_runs: Option<RawRunConn>,
+    branch: Option<RawBranch>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawApp {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBranch {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRunFile {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +466,11 @@ struct RawRun {
     event: Option<String>,
     url: Option<String>,
     workflow: Option<RawWorkflow>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(rename = "runAttempt")]
+    run_attempt: Option<u64>,
+    file: Option<RawRunFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,8 +523,14 @@ fn convert_suite(raw: RawSuite) -> (Suite, bool) {
         workflow: run
             .as_ref()
             .and_then(|r| r.workflow.as_ref().map(|w| w.name.clone())),
+        workflow_path: run
+            .as_ref()
+            .and_then(|r| r.file.as_ref().map(|f| f.path.clone())),
         run_id: run.as_ref().and_then(|r| r.database_id),
         run_number: run.as_ref().and_then(|r| r.run_number),
+        run_attempt: run.as_ref().and_then(|r| r.run_attempt),
+        created_at: run.as_ref().and_then(|r| r.created_at.clone()),
+        branch: raw.branch.map(|b| b.name),
         event: run.as_ref().and_then(|r| r.event.clone()),
         url: run.as_ref().and_then(|r| r.url.clone()),
         status: raw.status,
@@ -583,5 +815,188 @@ mod tests {
             parse_commit_response(&v, "x"),
             Err(VigiliaError::Api(_))
         ));
+    }
+
+    // --- workflow / event 絞り込みと run 一覧 ---
+
+    /// 実在コミット相当の応答(Release・CI・Dependabot 2 本・CI の再実行 / dispatch 重複)。
+    fn runs_fixture() -> serde_json::Value {
+        let suite = |id: u64, num: u64, attempt: u64, name: &str, path: Option<&str>, event: &str,
+                     created: &str, branch: Option<&str>, concl: &str| {
+            json!({
+              "app": {"name": "GitHub Actions"}, "status": "COMPLETED", "conclusion": concl,
+              "branch": branch.map(|b| json!({"name": b})),
+              "workflowRun": {"databaseId": id, "runNumber": num, "runAttempt": attempt,
+                              "createdAt": created, "event": event,
+                              "url": format!("https://github.com/octo/demo/actions/runs/{id}"),
+                              "workflow": {"name": name},
+                              "file": path.map(|p| json!({"path": p}))},
+              "checkRuns": {"pageInfo":{"hasNextPage":false},"nodes":[]}
+            })
+        };
+        json!({"data":{"repository":{"nameWithOwner":"octo/demo","object":{
+            "oid":"abeebf669a1fbb239d7bf537c88293d0b98177af",
+            "checkSuites":{"pageInfo":{"hasNextPage":false},"nodes":[
+              suite(10, 1, 1, "Release", Some(".github/workflows/release.yml"), "push",
+                    "2026-11-17T18:17:24Z", Some("release/1.0.1"), "SUCCESS"),
+              suite(11, 6, 1, "CI", Some(".github/workflows/ci.yml"), "push",
+                    "2026-11-17T18:17:12Z", Some("main"), "FAILURE"),
+              // CI の新しい run(前の失敗に取って代わる)。
+              suite(12, 7, 1, "CI", Some(".github/workflows/ci.yml"), "push",
+                    "2026-11-17T18:20:00Z", Some("main"), "SUCCESS"),
+              // 同じ CI の手動実行(event が違う)。
+              suite(13, 8, 1, "CI", Some(".github/workflows/ci.yml"), "workflow_dispatch",
+                    "2026-11-17T18:25:00Z", Some("main"), "CANCELLED"),
+              // パスを持たない動的 workflow。
+              suite(14, 1, 1, "Dependabot Updates", None, "dynamic",
+                    "2026-11-17T18:17:17Z", Some("main"), "SUCCESS")
+            ]}}},
+          "rateLimit":{"cost":1,"remaining":4949,"resetAt":"2026-11-17T19:23:25Z"}}})
+    }
+
+    fn wf(spec: &str) -> RunFilter {
+        RunFilter {
+            workflow: Some(spec.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn run一覧は作成時刻の新しい順で決定的に並ぶ() {
+        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        let runs = snap.runs(&RunFilter::default());
+        let ids: Vec<u64> = runs.iter().map(|r| r.run_id).collect();
+        assert_eq!(ids, vec![13, 12, 10, 14, 11]);
+        assert_eq!(runs[2].workflow_path.as_deref(), Some(".github/workflows/release.yml"));
+        assert_eq!(runs[2].status, "completed");
+        assert_eq!(runs[2].conclusion.as_deref(), Some("success"));
+        assert_eq!(runs[2].head_sha, "abeebf669a1fbb239d7bf537c88293d0b98177af");
+        assert_eq!(runs[2].branch.as_deref(), Some("release/1.0.1"));
+        assert_eq!(runs[2].run_attempt, Some(1));
+        // 同じ入力なら同じ並び。
+        assert_eq!(runs, snap.runs(&RunFilter::default()));
+    }
+
+    #[test]
+    fn workflowはパス_ファイル名_表示名のどれでも一致する() {
+        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        for spec in [".github/workflows/release.yml", "release.yml", "Release"] {
+            let ids: Vec<u64> = snap.runs(&wf(spec)).iter().map(|r| r.run_id).collect();
+            assert_eq!(ids, vec![10], "{spec}");
+        }
+        // 大文字小文字は区別する・部分一致はしない。
+        assert!(snap.runs(&wf("release")).is_empty());
+        assert!(snap.runs(&wf("RELEASE.YML")).is_empty());
+        // パスを持たない workflow は表示名で指定できる。
+        assert_eq!(snap.runs(&wf("Dependabot Updates")).len(), 1);
+    }
+
+    #[test]
+    fn eventの絞り込みは大文字小文字を区別しない() {
+        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        let f = RunFilter {
+            workflow: Some("ci.yml".into()),
+            event: Some("Workflow_Dispatch".into()),
+            since: None,
+        };
+        let ids: Vec<u64> = snap.runs(&f).iter().map(|r| r.run_id).collect();
+        assert_eq!(ids, vec![13]);
+    }
+
+    #[test]
+    fn sinceは作成時刻以後だけを残す() {
+        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        let f = RunFilter {
+            since: DateTime::parse_from_rfc3339("2026-11-17T18:17:24Z")
+                .ok()
+                .map(|d| d.with_timezone(&Utc)),
+            ..Default::default()
+        };
+        // ちょうど同時刻は含める(以後)。
+        let ids: Vec<u64> = snap.runs(&f).iter().map(|r| r.run_id).collect();
+        assert_eq!(ids, vec![13, 12, 10]);
+    }
+
+    #[test]
+    fn 同じworkflowとeventの複数runは最新だけで結論を出す() {
+        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        // push だけ: 古い失敗(#6)は新しい成功(#7)に取って代わられ、成功になる。
+        let f = RunFilter {
+            workflow: Some("ci.yml".into()),
+            event: Some("push".into()),
+            since: None,
+        };
+        let s = snap.filtered(&f).unwrap();
+        assert_eq!(s.suites.len(), 1);
+        assert_eq!(s.suites[0].run_id, Some(12));
+        assert_eq!(s.overall(), Overall::Success);
+        // event を指定しなければ push と dispatch の両方を結論に含める(取消が効く)。
+        let s = snap.filtered(&wf("ci.yml")).unwrap();
+        let ids: Vec<u64> = s.suites.iter().map(|x| x.run_id.unwrap()).collect();
+        assert_eq!(ids, vec![12, 13]);
+        assert_eq!(s.overall(), Overall::Cancelled);
+    }
+
+    #[test]
+    fn 再実行のattemptは同じrunなので1件として扱う() {
+        // 再実行は run id が同じまま attempt が増える。一覧には最新 attempt の 1 件だけが出る。
+        let mut v = runs_fixture();
+        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["workflowRun"]["runAttempt"] =
+            json!(2);
+        let snap = parse_commit_response(&v, "x").unwrap();
+        let r = &snap.runs(&wf("release.yml"))[0];
+        assert_eq!(r.run_attempt, Some(2));
+        assert_eq!(snap.runs(&wf("release.yml")).len(), 1);
+    }
+
+    #[test]
+    fn 一致するrunが無ければrunなし() {
+        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        let s = snap.filtered(&wf("nope.yml")).unwrap();
+        assert_eq!(s.overall(), Overall::NoRuns);
+        assert!(s.conclusive_overall().is_ok());
+    }
+
+    #[test]
+    fn 複数のworkflowに一致する指定は使用エラー() {
+        // 表示名 "CI" が別ファイルの workflow とも一致する場合は決められない。
+        let mut v = runs_fixture();
+        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["workflowRun"]["workflow"]["name"] =
+            json!("CI");
+        let snap = parse_commit_response(&v, "x").unwrap();
+        match snap.filtered(&wf("CI")) {
+            Err(VigiliaError::Usage(m)) => {
+                assert!(m.contains("release.yml") && m.contains("ci.yml"), "{m}");
+            }
+            other => panic!("使用エラーのはず: {other:?}"),
+        }
+        // ファイルパスで指定すれば曖昧さは無い。
+        assert!(snap.filtered(&wf("ci.yml")).is_ok());
+        // runs の一覧は曖昧でもエラーにせず全て返す。
+        assert_eq!(snap.runs(&wf("CI")).len(), 5 - 1);
+    }
+
+    #[test]
+    fn 絞り込み後の未完了は実行中になる() {
+        let mut v = runs_fixture();
+        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["status"] =
+            json!("IN_PROGRESS");
+        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["conclusion"] =
+            serde_json::Value::Null;
+        let snap = parse_commit_response(&v, "x").unwrap();
+        assert_eq!(snap.filtered(&wf("release.yml")).unwrap().overall(), Overall::InProgress);
+        // 他の workflow の未完了は影響しない(CI だけなら完了済み)。
+        assert!(snap.filtered(&wf("ci.yml")).unwrap().overall().is_terminal());
+    }
+
+    #[test]
+    fn 旧形式のキャッシュにも新フィールドは既定値で読める() {
+        let s: Suite = serde_json::from_value(json!({
+            "app":"a","workflow":"CI","run_id":1,"run_number":1,"event":"push","url":null,
+            "status":"COMPLETED","conclusion":"SUCCESS","jobs":[]
+        }))
+        .unwrap();
+        assert_eq!(s.workflow_path, None);
+        assert_eq!(s.created_at, None);
     }
 }
