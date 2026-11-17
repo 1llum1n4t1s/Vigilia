@@ -22,7 +22,40 @@ CI の状態取得を別枠の **GraphQL** で行い、取得結果を **ファ�
 
 ## インストール
 
-ビルド済みバイナリは配布していません。Rust(edition 2024 対応の stable)でソースからインストールします。
+ビルド済みバイナリを https://vigilia.kagayoi.com(Cloudflare R2)で配布しています。ダウンロードは SHA-256 のチェックサムで照合し、Windows の実行ファイルは Authenticode 署名の署名者も検証します。
+
+Windows x64(PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/1llum1n4t1s/Vigilia/main/install.ps1 | iex
+```
+
+macOS(Apple Silicon)と Linux(x86_64 / aarch64。glibc ベースのディストリビューション、ubuntu-24.04 でビルド):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/1llum1n4t1s/Vigilia/main/install.sh | sh
+```
+
+どちらも最新版をインストールします。シェルで版を指定するには `sh -s -- --version 1.0.1` を付けます。`| iex` には引数を渡せないため、PowerShell では script block 形式にします。
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/1llum1n4t1s/Vigilia/main/install.ps1))) -Version 1.0.1
+```
+
+`install.sh` は `vigilia` を `~/.local/bin` に置き(`--install-dir` または `VIGILIA_INSTALL_DIR` で変更可)、PATH に無ければ案内を表示します。
+
+アーカイブを直接ダウンロードすることもできます。`latest.json` に最新の版と、ターゲットごとのアーカイブ・チェックサムのファイル・SHA-256 が載っています。
+
+| ターゲット | アーカイブ |
+| --- | --- |
+| Windows x64 | `<版>/vigilia-<版>-x86_64-pc-windows-msvc.zip` |
+| macOS Apple Silicon | `<版>/vigilia-<版>-aarch64-apple-darwin.tar.gz` |
+| Linux x86_64 | `<版>/vigilia-<版>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 | `<版>/vigilia-<版>-aarch64-unknown-linux-gnu.tar.gz` |
+
+各アーカイブの隣に `.sha256`(`sha256sum` 形式)があります。macOS のバイナリは ad-hoc 署名で、公証はしていません。
+
+ソースからビルドする場合は、Rust(edition 2024 対応の stable)でインストールします。
 
 ```sh
 cargo install --git https://github.com/1llum1n4t1s/Vigilia

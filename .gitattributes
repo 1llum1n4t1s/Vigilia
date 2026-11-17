@@ -1,0 +1,2 @@
+# install.sh は raw.githubusercontent.com から直接実行されるため、チェックアウト環境に関係なく LF に固定する。
+*.sh text eol=lf

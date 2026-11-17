@@ -23,3 +23,8 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Install / publish script tests
+        # install.ps1（Windows のみ。Windows PowerShell 5.1 でも実行）・install.sh・Publish-R2.ps1 の入力検査を、
+        # ローカルのモック HTTP で確かめる。R2 にも Certum にも接続しない。
+        shell: pwsh
+        run: ./tests/Test-Install.ps1

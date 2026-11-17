@@ -1,0 +1,344 @@
+name: Release
+
+# Vigilia の配布物を GitHub Actions でビルド・検証・（Windows は）署名し、Cloudflare R2
+# （https://vigilia.kagayoi.com）へ配信する。タグも GitHub Release も使わず、R2 が配布の唯一の入口になる。
+#
+# - 起動: release/<Cargo.toml の版> ブランチへの push（/vava が push すると始まる）。
+#   手動実行 (workflow_dispatch) は、同じ release/<版> ブランチを指定した再実行にだけ使う
+#   （R2 に同じ版があれば内容が同一のときだけ成功し、違えば上書きせず失敗する）。
+#   skip_upload を付けると、ビルド・署名・検証だけ行い R2 へ配信しない（成果物は Actions に残る）。
+#   GitHub のブランチフィルタは glob（正規表現ではない）。release/1.0.1 のような名前に一致する。
+# - 構成: guard → build（4 ターゲットの matrix）→ sign-windows → publish。
+#     guard         release/<版> と Cargo.toml の版の一致だけを確かめる。
+#     build         各ターゲットのランナーでネイティブにビルドし、版を確認する。macOS・Linux はここで tar.gz に梱包する。
+#                   Windows は署名前の vigilia.exe だけを渡す。Secrets も Environment も渡さない。
+#     sign-windows  vigilia.exe を Sigilune（Certum のクラウド鍵）で署名し、zip に梱包して署名者を検証する。
+#                   署名用 Secrets は署名 step だけ。
+#     publish       何もビルドせず、ここまでの 4 アーカイブだけを R2 へ配信する。CLOUDFLARE_API_TOKEN は配信 step だけ。
+# - macOS は公証なし。リンカーが付ける ad-hoc 署名が壊れていないこと（codesign --verify）まで確かめる。
+# - 配信の順序: 入力・bucket・zone の確認 → 版付きの不変物 → 公開 URL でハッシュ照合 → latest.json → 固定名だけ purge
+#   （詳細は scripts/Publish-R2.ps1）。
+# - Secrets（SIGILUNE_EMAIL / SIGILUNE_TOTP_URI / CLOUDFLARE_API_TOKEN）は Environment "release"
+#   （release/* ブランチだけ許可）にだけ置く。
+on:
+  push:
+    branches: ['release/**']
+  workflow_dispatch:
+    inputs:
+      skip_upload:
+        description: 'ビルド・署名・検証だけ行い、R2 へ配信しない (成果物は Actions に残る)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # リリースは repo 全体で同時に走らせない。release ブランチが並走しても、latest.json（固定名）を取り合って
+  # 後退させないため。途中で止めると R2 が半端な状態になり得るので cancel もしない（Skilvella と同じ）。
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    # release/<版> ブランチと Cargo.toml の版が一致しなければ止める（別の版を誤って配信しない）。
+    if: github.repository == '1llum1n4t1s/Vigilia'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the branch and the version
+        id: version
+        shell: bash
+        run: |
+          # [package] の version を直接読む（toolchain の導入前）。
+          version="$(sed -n '/^\[package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p}' Cargo.toml | head -n 1)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "could not read the Cargo version: $version" >&2; exit 1; }
+          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "release/$version" ]]; then
+            echo "ref $GITHUB_REF_NAME does not match release/$version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 4 ターゲットとも GitHub 提供ランナーが自分のネイティブ環境でビルドする（クロスビルドはしない）。
+          # Linux x64 は glibc の下限を保つため latest ではなく ubuntu-24.04 に固定する。
+          # macOS Intel と Windows arm64 は配布対象外。
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Secrets と Environment は渡さない（ビルド・梱包だけ）。
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        # 配布物はキャッシュを使わず、毎回まっさらな target/ から作る（rust-cache は使わない）。
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Assert the runner builds the matrix target natively
+        # matrix の runs-on の取り違え（例: ARM ランナーで x64 を作る）を、ビルド前に失敗させて防ぐ。
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host" = "$TARGET" || { echo "host $host does not match target $TARGET" >&2; exit 1; }
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Record the glibc symbol versions (Linux)
+        # Linux バイナリが要求する glibc のシンボル版を、ログに残すだけ（合否にはしない）。
+        # 配布物は ubuntu-24.04 でビルドしたものなので、古い glibc の環境で動くかは保証しない。
+        if: runner.os == 'Linux'
+        run: |
+          if command -v objdump >/dev/null 2>&1; then
+            objdump -T target/release/vigilia | grep -o 'GLIBC_[0-9.]*' | sort -uV | paste -sd ' ' -
+            echo "highest required: $(objdump -T target/release/vigilia | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)"
+          else
+            echo "objdump is not available; skipped"
+          fi
+
+      - name: Verify the binary version
+        run: |
+          exe=target/release/vigilia
+          if [[ "$RUNNER_OS" == "Windows" ]]; then exe=target/release/vigilia.exe; fi
+          reported="$("$exe" --version)"
+          test "$reported" = "vigilia $VERSION" || { echo "unexpected version: $reported" >&2; exit 1; }
+          # macOS はリンカーが付ける ad-hoc 署名の状態を確かめる（公証はしない）。
+          if [[ "$RUNNER_OS" == "macOS" ]]; then codesign --verify --verbose "$exe"; fi
+
+      - name: Test (Linux x64)
+        # CI（ci.yml）と同じ検査を、配布前にもう一度 1 ターゲットで通す。配布物には影響しない（debug ビルド）。
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --locked
+
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          name="vigilia-$VERSION-$TARGET.tar.gz"
+          dist="$RUNNER_TEMP/dist"
+          stage="$RUNNER_TEMP/stage"
+          rm -rf "$dist" "$stage"
+          mkdir -p "$dist" "$stage"
+          cp target/release/vigilia README.md README.ja.md LICENSE "$stage/"
+          chmod 755 "$stage/vigilia"
+          # macOS の tar が付ける拡張属性（._*）を作らない。ファイル名は平置きの 4 つだけ（install.sh が照合する）。
+          COPYFILE_DISABLE=1 tar -czf "$dist/$name" -C "$stage" vigilia README.md README.ja.md LICENSE
+          if command -v sha256sum >/dev/null 2>&1; then hash="$(sha256sum "$dist/$name" | cut -d ' ' -f 1)"; else hash="$(shasum -a 256 "$dist/$name" | cut -d ' ' -f 1)"; fi
+          # sha256sum 互換の "<hash>  <file>"（末尾の改行なし。Publish-R2.ps1 と install.* は Trim して照合する）。
+          printf '%s  %s' "$hash" "$name" > "$dist/$name.sha256"
+          echo "DIST_DIR=$dist" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$dist/$name" >> "$GITHUB_ENV"
+
+      - name: Verify the package (macOS / Linux)
+        # 配信するアーカイブそのものを展開し、内容と版を照合する。失敗すれば成果物の保存も R2 への配信も行わない。
+        if: runner.os != 'Windows'
+        run: |
+          check="$RUNNER_TEMP/verify"
+          rm -rf "$check"
+          mkdir -p "$check"
+          tar -xzf "$ARCHIVE" -C "$check"
+          actual="$(ls -A "$check" | LC_ALL=C sort | tr '\n' ' ')"
+          test "$actual" = "LICENSE README.ja.md README.md vigilia " || { echo "unexpected package contents: $actual" >&2; exit 1; }
+          reported="$("$check/vigilia" --version)"
+          test "$reported" = "vigilia $VERSION" || { echo "version mismatch: $reported" >&2; exit 1; }
+          (cd "$DIST_DIR" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "$(basename "$ARCHIVE").sha256"; else shasum -a 256 -c "$(basename "$ARCHIVE").sha256"; fi)
+
+      - name: Upload the package (macOS / Linux)
+        if: runner.os != 'Windows'
+        # actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the unsigned binary (Windows)
+        # 署名は Secrets を持つ sign-windows ジョブで行う。ここでは署名前の exe だけを渡す。
+        if: runner.os == 'Windows'
+        # actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: target/release/vigilia.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  sign-windows:
+    # 署名と zip 梱包・検証。署名用 Secrets は Environment "release" にあり、署名 step にだけ渡す。
+    needs: [guard, build]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      VERSION: ${{ needs.guard.outputs.version }}
+      SIGNER: Open Source Developer Yuichiro Shinozaki
+    steps:
+      - name: Checkout
+        # README・LICENSE を同梱するために使う。ビルドはしない。
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the unsigned binary
+        # actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/unsigned
+
+      - name: Install Sigilune
+        id: sigilune
+        uses: 1llum1n4t1s/Sigilune@05006dcad019e5e863a08985b9208d72004f1b5f # v1.1.3
+
+      - name: Stage files
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'vigilia'
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'unsigned/vigilia.exe') $dist
+          Copy-Item README.md, README.ja.md, LICENSE $dist
+          "DIST=$dist" >> $env:GITHUB_ENV
+
+      - name: Sign with Sigilune
+        env:
+          SIGILUNE_EMAIL: ${{ secrets.SIGILUNE_EMAIL }}
+          SIGILUNE_TOTP_URI: ${{ secrets.SIGILUNE_TOTP_URI }}
+        run: |
+          try {
+            # 署名後に有効性・署名者・タイムスタンプを検証し、失敗なら非0で止まる。
+            sigilune sign (Join-Path $env:DIST 'vigilia.exe')
+            if ($LASTEXITCODE -ne 0) { throw "sigilune sign failed ($LASTEXITCODE)" }
+          } finally {
+            # ランナー上の Certum セッションを残さない。
+            sigilune logout | Out-Null
+          }
+
+      - name: Package
+        run: |
+          $name = "vigilia-$env:VERSION-$env:TARGET.zip"
+          $out = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $zip = Join-Path $out $name
+          Compress-Archive -Path (Join-Path $env:DIST '*') -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content -LiteralPath "$zip.sha256" -Encoding ascii -NoNewline
+          "ARCHIVE=$zip" >> $env:GITHUB_ENV
+
+      - name: Verify the package
+        # 配信する zip そのものを展開し、同梱ファイル・版・署名（有効・署名者・タイムスタンプ）を照合する。
+        # ここで失敗すれば成果物の保存も R2 への配信も行わない。
+        run: |
+          $check = Join-Path $env:RUNNER_TEMP 'verify'
+          Expand-Archive -LiteralPath $env:ARCHIVE -DestinationPath $check
+          $expected = @('LICENSE', 'README.ja.md', 'README.md', 'vigilia.exe')
+          $actual = @(Get-ChildItem -LiteralPath $check -File | ForEach-Object Name | Sort-Object)
+          if (Compare-Object $expected $actual) { throw "unexpected package contents: $($actual -join ', ')" }
+          $exe = Join-Path $check 'vigilia.exe'
+          $reported = (& $exe --version)
+          if ($reported -ne "vigilia $env:VERSION") { throw "version mismatch: $reported" }
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          $cn = if ($sig.SignerCertificate) { $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) } else { '' }
+          if ($sig.Status -ne 'Valid' -or $cn -cne $env:SIGNER -or -not $sig.TimeStamperCertificate) { throw "signature verification failed: status $($sig.Status), signer '$cn'" }
+          Write-Host "verified $env:ARCHIVE  sha256=$((Get-FileHash -LiteralPath $env:ARCHIVE -Algorithm SHA256).Hash)"
+
+      - name: Upload the package
+        # actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-x86_64-pc-windows-msvc
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    # ここまでの成果物だけを R2 へ配信する（ビルドしない）。全ジョブが成功し、skip_upload でないときだけ動く。
+    needs: [guard, build, sign-windows]
+    if: inputs.skip_upload != true
+    runs-on: windows-latest
+    timeout-minutes: 40
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        # 配信スクリプトだけを使う。ビルドはしない。
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the packages
+        # 4 ターゲットの dist-* だけを 1 フォルダーへ集める（unsigned-* は取らない）。
+        # actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+
+      - name: Verify the Windows signature
+        # 配信直前にも、実際に配る zip の署名者を確かめる。
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "dist/vigilia-$env:VERSION-x86_64-pc-windows-msvc.zip"
+          $check = Join-Path $env:RUNNER_TEMP 'verify'
+          Expand-Archive -LiteralPath $zip -DestinationPath $check
+          $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $check 'vigilia.exe')
+          $cn = if ($sig.SignerCertificate) { $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) } else { '' }
+          if ($sig.Status -ne 'Valid' -or $cn -cne 'Open Source Developer Yuichiro Shinozaki' -or -not $sig.TimeStamperCertificate) { throw "vigilia.exe signature verification failed: status $($sig.Status), signer '$cn'" }
+
+      - name: Publish to R2
+        # 版付きの不変ファイルを先に置き、公開 URL で照合してから latest.json を更新する（詳細は scripts/Publish-R2.ps1）。
+        # 同じ版が R2 にあれば、内容が同一のときだけ成功する（別内容は上書きせず失敗）。
+        # R2 の latest.json がより新しい版なら latest.json は更新しない。
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          # 失敗は Publish-R2.ps1 が例外 (throw) で知らせる。ここで $LASTEXITCODE を見ると、配信が全部成功した後でも
+          # スクリプト内部のネイティブ呼び出しの終了コードが残っていて誤って失敗扱いになるため、確認しない。
+          ./scripts/Publish-R2.ps1 -Version $env:VERSION -DistributionDirectory (Join-Path $env:RUNNER_TEMP 'dist')

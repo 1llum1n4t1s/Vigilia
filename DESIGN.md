@@ -86,8 +86,18 @@ GraphQL の `Raw*` 型と `Snapshot` を分け、キャッシュ形式・JSON �
 ### reqwest は blocking + rustls
 リクエストが直列でループが単純なため、非同期ランタイムを持ち込まない。TLS は rustls で OS 依存を減らす。
 
+## 配布
+
+利用者は CI も Rust も不要で使えるよう、ビルド済みバイナリを Cloudflare R2 から配る（運用手順は AGENTS.md の「リリースと配信」）。
+
+- **R2 だけを入口にする。** Git タグ・GitHub Release は使わない。`release/<版>` ブランチの push で `release.yml` が動く。本人の他製品（Sigilune・Skilvella など）と同じ方式で、配信の転送実装（`scripts/R2Transfer.Core.cs`）も共通の同梱コピーを使う。
+- **版付きは不変、最後に `latest.json`。** 版付きのアーカイブと `.sha256` を新規作成だけで置き、公開 URL から取り直して照合してからフィードを進める。途中で失敗しても、利用者が見る `latest.json` は古い完全な版のまま残る。
+- **`latest.json` は複数ターゲットを表す。** 導入スクリプトは版とターゲットからアーカイブのパスを自分で組み立て、フィードの値は照合にだけ使う（任意のパスへ誘導されない）。
+- **導入スクリプトは検証してから置く。** どちらも https のみ・リダイレクトを辿らない・SHA-256 照合。Windows は Authenticode 署名者の CN も照合する。macOS は公証なしの ad-hoc 署名で、導入時は署名の整合だけ確かめる。
+- **Secrets を持つ job を最小にする。** ビルドと梱包は Secrets なしの job で行い、署名と配信だけを Environment `release` の job に置く。
+
 ## 既知の制約
 
 - 1コミットあたり check suite 50件、1 suite あたり check run 30件（run id 起点は50件）を超える分は取得しない。
-- 対応は Windows x64（主）と macOS Apple Silicon。Intel Mac は対象外。Linux は CI でのビルド・テスト対象で、キャッシュ先は `$XDG_CACHE_HOME`。
+- 配布するのは Windows x64（主）、macOS Apple Silicon、Linux x64 / arm64（glibc）。Intel Mac と Windows arm64 は対象外。Linux のキャッシュ先は `$XDG_CACHE_HOME`。
 - github.com のみ（GitHub Enterprise のホストは扱わない）。
