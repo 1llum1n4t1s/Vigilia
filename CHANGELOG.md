@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 - 2026-11-18
+
+### 追加
+
+- Windows x64、macOS Apple Silicon、Linux x64 / arm64 向けのビルド済みバイナリを `https://vigilia.kagayoi.com` から配布する。Windows 版はコード署名済み。各ファイルに SHA-256 を添える。
+- 導入スクリプト `install.ps1`(Windows)と `install.sh`(macOS / Linux)を追加。最新版または指定した版を取得し、SHA-256(Windows は署名者も)を照合してから配置する。実行中の `vigilia` があっても置き換えられる。
+
 ## 1.0.0 - 2026-11-18
 
 ### 追加

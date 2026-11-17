@@ -1,6 +1,6 @@
 [package]
 name = "vigilia"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Watch GitHub Actions through GraphQL without spending the REST rate limit, and share the result across sessions."
 license = "MIT"
