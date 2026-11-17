@@ -1,6 +1,6 @@
 //! 「キャッシュ → (必要なら) GraphQL」の取得を 1 か所にまとめる層。
 //!
-//! `status` / `watch` はどちらもここを通るため、複数セッションが同じ対象を
+//! `status` / `watch` / `runs` はいずれもここを通るため、複数セッションが同じ対象を
 //! 見ているときは TTL 内の取得が 1 回に集約される。
 
 use crate::cache::{self, Cache};
@@ -68,6 +68,25 @@ fn fnv1a(s: &str) -> u64 {
     s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+/// run 対象で `--repo` が指定されているとき、run の実際のリポジトリと一致するか検査する。
+/// (SHA・ブランチ対象は repo をクエリに含めて取得するため、不一致は起こらない。)
+fn check_repo(
+    repo: Option<&(String, String)>,
+    target: &Target,
+    snap: &Snapshot,
+) -> Result<()> {
+    if let (Target::Run(id), Some((o, n))) = (target, repo) {
+        let want = format!("{o}/{n}");
+        if !snap.repo.eq_ignore_ascii_case(&want) {
+            return Err(VigiliaError::Usage(format!(
+                "run {id} は {} のものです(--repo {want} と一致しません)",
+                snap.repo
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Resolver {
@@ -154,7 +173,16 @@ impl Resolver {
         Ok(fetched)
     }
 
+    /// 取得元(キャッシュ・古いキャッシュ・API)によらず、run と `--repo` の不一致を必ず検出する。
+    /// run id のキャッシュキーは repo を含まないため、他リポジトリの run を `--repo` 付きで
+    /// 引いてもキャッシュが命中し得る。
     fn get_unfiltered(&mut self) -> Result<Fetched> {
+        let fetched = self.fetch_or_cached()?;
+        check_repo(self.repo.as_ref(), &self.target, &fetched.snapshot)?;
+        Ok(fetched)
+    }
+
+    fn fetch_or_cached(&mut self) -> Result<Fetched> {
         let Some(key) = self.cache.as_ref().map(|_| self.key()) else {
             let snapshot = self.fetch_api()?;
             return Ok(Fetched {
@@ -245,6 +273,49 @@ mod tests {
             suites_truncated: false,
             cost: None,
         }
+    }
+
+    /// キャッシュ命中経路(API を呼ばない)を作る。client は None のままなので、
+    /// 万一 API 経路へ進めば `gh` を起動しようとする(= テストが誤って成功しない)。
+    fn cached_resolver(name: &str, repo: (&str, &str), snap: &Snapshot) -> Resolver {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("svc-{name}-{}-{}", std::process::id(), cache::now_ms()));
+        let cache = Cache::new(dir).unwrap();
+        cache.write("run__123456789", snap).unwrap();
+        Resolver {
+            repo: Some((repo.0.into(), repo.1.into())),
+            target: Target::Run(123456789),
+            cache: Some(cache),
+            ttl: Duration::from_secs(60),
+            freshness: Freshness::Default,
+            client: None,
+        }
+    }
+
+    #[test]
+    fn キャッシュ命中でもrepoの不一致を検出する() {
+        // snapshot の repo は "o/r"。--repo が別リポジトリなら、キャッシュ命中でも使用エラー。
+        let snap = done_snapshot(".github/workflows/ci.yml");
+        let mut r = cached_resolver("mismatch", ("other", "x"), &snap);
+        match r.get() {
+            Err(VigiliaError::Usage(m)) => assert!(m.contains("o/r") && m.contains("other/x"), "{m}"),
+            other => panic!("使用エラーのはず: {:?}", other.map(|f| f.source)),
+        }
+        // 大文字小文字だけの違いは一致扱い。
+        let mut r = cached_resolver("match", ("O", "R"), &snap);
+        let f = r.get().expect("一致すれば通る");
+        assert_eq!(f.source, Source::Cache);
+    }
+
+    #[test]
+    fn repo検査はrun対象だけに働く() {
+        let snap = done_snapshot(".github/workflows/ci.yml");
+        let other = Some(("other".to_string(), "x".to_string()));
+        assert!(check_repo(other.as_ref(), &Target::Run(1), &snap).is_err());
+        assert!(check_repo(None, &Target::Run(1), &snap).is_ok());
+        assert!(check_repo(other.as_ref(), &Target::Sha("abc1234".into()), &snap).is_ok());
     }
 
     #[test]

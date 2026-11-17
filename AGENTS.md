@@ -54,7 +54,7 @@ cargo clippy --locked --all-targets -- -D warnings
 - **リクエストは直列。** 並列化しない。`watch` と `runs --wait` の `--interval` は 5 秒未満を拒否する（`commands.rs` の `MIN_INTERVAL_SECS`）。
 - **トークンを出さない。** `GH_TOKEN` / `GITHUB_TOKEN` → `gh auth token` の順で取得し、ログ・エラー文・出力・キャッシュへ書かない。
 - **終了コードの表は3か所を揃える。** `error.rs` の `exit`、`main.rs` の `watch` の doc コメント、README の表。コードを変えたら全て更新する。
-- **結論の規則は `model.rs` に集約する。** `watch` と `status` は同じ `conclusive_overall()` を使う。suite が切り捨てられた状態で「成功」と断定しない（エラーにする）。`--workflow` / `--event` の絞り込み（複数一致の規則を含む）も `Snapshot::filtered()` に置き、取得後に適用する（キャッシュのキーに条件を入れない）。
+- **結論の規則は `model.rs` に集約する。** `watch` と `status` は同じ `conclusive_overall()` を使う。suite が切り捨てられた状態では、成功・取消・run なし（絞り込み後は失敗も）を断定しない（エラーにする。`conclusive_overall(filtered)`）。`--workflow` / `--event` の絞り込み（複数一致の規則を含む）も `Snapshot::filtered()` に置き、取得後に適用する（キャッシュのキーに条件を入れない）。
 - **キャッシュは最適化であり正本ではない。** 読めない・壊れた・版違いは「なし」として扱い、書き込みは一時ファイル → rename。`cache.rs` の `ENTRY_VERSION` は `Snapshot` の形式を非互換に変えたときに上げる。
 - **ユーザー向け文言・コードコメントは日本語。** 既存の書き方に合わせる。
 

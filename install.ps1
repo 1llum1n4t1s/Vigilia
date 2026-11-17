@@ -31,7 +31,9 @@ Download site. Default: https://vigilia.kagayoi.com. Must be https (plain http o
 address, so that tests can use a local mock server). The signature check below always applies.
 
 .PARAMETER InstallDir
-Default: %LOCALAPPDATA%\Programs\Vigilia
+Default (empty): %LOCALAPPDATA%\Programs\Vigilia, a folder dedicated to Vigilia, where README.md, README.ja.md and
+LICENSE are copied too. Any other folder may be shared (for example an existing bin directory), so only vigilia.exe
+is placed there (the documents are not copied) and only the leftovers named vigilia.exe.old-* are cleaned up.
 
 .PARAMETER NoPath
 Do not add InstallDir to the user PATH.
@@ -46,7 +48,7 @@ Keep the temporary download folder (for troubleshooting).
 param(
     [string]$Version = 'latest',
     [string]$BaseUrl = 'https://vigilia.kagayoi.com',
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\Vigilia'),
+    [string]$InstallDir = '',
     [switch]$NoPath,
     [string]$ZipPath,
     [switch]$KeepDownload
@@ -66,11 +68,83 @@ param(
 
     function Write-Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 
+    # --- User PATH helpers -------------------------------------------------------------------------------------
+    # The user PATH lives in HKCU\Environment\Path. It is usually REG_EXPAND_SZ and may contain %VAR% references,
+    # so it is read WITHOUT expanding, written back with its original value kind, and compared entry by entry
+    # after expanding. [Environment]::GetEnvironmentVariable/SetEnvironmentVariable would flatten the value to an
+    # expanded REG_SZ string. Get-UserPathUpdate is pure (no registry access); tests load it from this file.
+
+    # Returns $null when $Dir is already on the path, else the new raw value and the registry value kind to use.
+    function Get-UserPathUpdate([bool]$Exists, [string]$Raw, $Kind, [string]$Dir) {
+        $string = [Microsoft.Win32.RegistryValueKind]::String
+        $expand = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        if ($Exists -and $Kind -ne $string -and $Kind -ne $expand) { throw "The user Path has an unexpected registry value type ($Kind)." }
+        $want = [Environment]::ExpandEnvironmentVariables($Dir).Trim().TrimEnd('\')
+        foreach ($entry in @($Raw -split ';')) {
+            if ($entry -and [Environment]::ExpandEnvironmentVariables($entry).Trim().TrimEnd('\') -ieq $want) { return $null }
+        }
+        # Existing entries are kept verbatim (unexpanded); only a trailing separator is dropped before appending.
+        $value = if ($Raw) { $Raw.TrimEnd(';') + ';' + $Dir } else { $Dir }
+        # A missing value is created as REG_EXPAND_SZ, the kind Windows itself uses for the user Path.
+        $newKind = if ($Exists) { $Kind } else { $expand }
+        return [pscustomobject]@{ Value = $value; Kind = $newKind }
+    }
+
+    # Tells running programs (Explorer, new terminals) that the environment changed, as SetEnvironmentVariable did.
+    function Send-EnvironmentChange {
+        try {
+            if (-not ('VigiliaInstall.NativeMethods' -as [type])) {
+                Add-Type -Namespace VigiliaInstall -Name NativeMethods -MemberDefinition (@(
+                    '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]',
+                    'public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+                ) -join "`n")
+            }
+            $result = [UIntPtr]::Zero
+            # HWND_BROADCAST, WM_SETTINGCHANGE, lParam "Environment", SMTO_ABORTIFHUNG, 5 second timeout.
+            [void][VigiliaInstall.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+        } catch {
+            Write-Warning "Could not notify running programs of the PATH change: $($_.Exception.Message)"
+        }
+    }
+
+    # Adds $Dir to the user PATH in the registry. Returns $true when it was added, $false when already present.
+    function Add-ToUserPath([string]$Dir) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+        try {
+            $exists = @($key.GetValueNames()) -contains 'Path'
+            $raw = ''
+            $kind = $null
+            if ($exists) {
+                $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $kind = $key.GetValueKind('Path')
+            }
+            $update = Get-UserPathUpdate $exists $raw $kind $Dir
+            if (-not $update) { return $false }
+            $key.SetValue('Path', $update.Value, $update.Kind)
+        } finally {
+            $key.Close()
+        }
+        Send-EnvironmentChange
+        return $true
+    }
+
     if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'install.ps1 is for Windows. On macOS / Linux use install.sh.' }
     if (-not [Environment]::Is64BitOperatingSystem) { throw 'Vigilia requires 64-bit Windows.' }
     if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') {
         Write-Warning 'Only an x64 build is published. It runs under emulation on Windows on ARM.'
     }
+
+    # -InstallDir is empty by default (so that "irm | iex", which cannot pass arguments, behaves the same as a
+    # normal run). An empty value means the default folder, which is dedicated to Vigilia. Whether the resolved
+    # folder is that default decides if the documents are copied (a folder given explicitly may be shared).
+    # This runs after the platform checks, and tolerates an empty LOCALAPPDATA: an explicit -InstallDir still
+    # works (no documents are copied then), while omitting it stops with a clear message.
+    $defaultInstallDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs\Vigilia' } else { '' }
+    if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        if (-not $defaultInstallDir) { throw 'LOCALAPPDATA is not set, so the default install folder cannot be determined. Pass -InstallDir.' }
+        $InstallDir = $defaultInstallDir
+    }
+    $isDefaultInstallDir = [bool]$defaultInstallDir -and ([IO.Path]::GetFullPath($InstallDir).TrimEnd('\') -ieq [IO.Path]::GetFullPath($defaultInstallDir).TrimEnd('\'))
     # Windows PowerShell 5.1 may default to TLS 1.0, so enable TLS 1.2.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -139,9 +213,12 @@ param(
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         # A running exe cannot be overwritten or deleted, but it can be renamed. Move the old one aside first,
         # put the new one in place, and treat a failure to delete the old file as a warning only.
-        # Leftovers from earlier runs are cleaned up the same way (best effort).
-        foreach ($old in @(Get-ChildItem -LiteralPath $InstallDir -Filter '*.old-*' -File -ErrorAction SilentlyContinue)) {
-            try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
+        # Leftovers from earlier runs are cleaned up the same way (best effort). Only names this script creates
+        # ("<binary>.old-*") are touched, because InstallDir may be a shared folder holding unrelated *.old-* files.
+        foreach ($name in $Binaries) {
+            foreach ($old in @(Get-ChildItem -LiteralPath $InstallDir -Filter "$name.old-*" -File -ErrorAction SilentlyContinue)) {
+                try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
+            }
         }
         foreach ($name in $Binaries) {
             $dest = Join-Path $InstallDir $name
@@ -162,18 +239,23 @@ param(
                 catch { Write-Warning "Could not remove the previous $name ($aside); it is probably still running. It will be removed by the next install." }
             }
         }
-        foreach ($name in @('README.md', 'README.ja.md', 'LICENSE')) {
-            $src = Join-Path $extract $name
-            if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
+        # The documents are copied only into the default, Vigilia-dedicated folder. Any other folder may be shared
+        # (for example an existing bin directory), where overwriting README / LICENSE would be harmful.
+        if ($isDefaultInstallDir) {
+            foreach ($name in @('README.md', 'README.ja.md', 'LICENSE')) {
+                $src = Join-Path $extract $name
+                if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
+            }
         }
         Write-Step "Installed to $InstallDir"
 
         if (-not $NoPath) {
-            $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-            $entries = @(if ($userPath) { $userPath -split ';' | Where-Object { $_ } })
-            if (-not ($entries | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) {
-                [Environment]::SetEnvironmentVariable('Path', (@($entries + $InstallDir) -join ';'), 'User')
-                Write-Step 'Added to the user PATH (open a new terminal to use it)'
+            # The binary is already in place, so a PATH problem (for example a Path value of an unexpected registry
+            # type, which is left untouched) is only a warning: the install itself still succeeds.
+            try {
+                if (Add-ToUserPath $InstallDir) { Write-Step 'Added to the user PATH (open a new terminal to use it)' }
+            } catch {
+                Write-Warning "Installed, but the user PATH was not updated: $($_.Exception.Message) Add $InstallDir to PATH yourself."
             }
             if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) { $env:Path = "$env:Path;$InstallDir" }
         }

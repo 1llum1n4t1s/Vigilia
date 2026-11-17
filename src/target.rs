@@ -119,11 +119,15 @@ pub fn parse_repo(s: &str) -> Result<(String, String)> {
 }
 
 /// git の remote URL(SSH / HTTPS)から github.com の (owner, repo) を取り出す。
+/// ホストは `github.com` と、ポート 443 の SSH 用の `ssh.github.com` だけを受け付ける。
 pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
     let url = url.trim();
     // scp 風: git@github.com:owner/repo.git
     // URL 風: ssh://git@github.com/owner/repo.git, https://github.com/owner/repo(.git)
-    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
+    let path = if let Some(rest) = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("git@ssh.github.com:"))
+    {
         rest
     } else {
         let after_scheme = url.split_once("://").map(|(_, r)| r)?;
@@ -132,7 +136,9 @@ pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
         let (host, path) = after_user.split_once('/')?;
         // ポート指定(ssh://...:22)は無視
         let host = host.split(':').next().unwrap_or(host);
-        if !host.eq_ignore_ascii_case("github.com") {
+        // `ssh.github.com`(ポート 443 の SSH。例: ssh://git@ssh.github.com:443/o/r.git)は
+        // github.com への SSH 接続の別口なので github.com として扱う。GitHub Enterprise は対象外。
+        if !host.eq_ignore_ascii_case("github.com") && !host.eq_ignore_ascii_case("ssh.github.com") {
             return None;
         }
         path
@@ -214,6 +220,15 @@ mod tests {
         assert_eq!(parse_github_remote("https://github.com/o/r.git/"), want);
         assert_eq!(parse_github_remote("https://user:tok@github.com/o/r.git"), want);
         assert_eq!(parse_github_remote("ssh://git@github.com:22/o/r.git"), want);
+        // ポート 443 の SSH(ssh.github.com)も github.com として受理する。
+        assert_eq!(parse_github_remote("ssh://git@ssh.github.com:443/o/r.git"), want);
+        assert_eq!(parse_github_remote("ssh://git@SSH.GitHub.com:443/o/r"), want);
+        // scp 形式の ssh.github.com も受理する。
+        assert_eq!(parse_github_remote("git@ssh.github.com:o/r.git"), want);
+        assert_eq!(parse_github_remote("git@ssh.github.example.com:o/r.git"), None);
+        // 別ホスト(GitHub Enterprise・似た名前)は受理しない。
+        assert_eq!(parse_github_remote("ssh://git@ssh.github.example.com:443/o/r.git"), None);
+        assert_eq!(parse_github_remote("ssh://git@evilgithub.com/o/r.git"), None);
         assert_eq!(parse_github_remote("https://gitlab.com/o/r.git"), None);
         assert_eq!(parse_github_remote("not a url"), None);
     }

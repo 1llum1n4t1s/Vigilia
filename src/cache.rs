@@ -25,7 +25,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 再実行(re-run)で変わり得るため無期限にはしない。
 pub const TERMINAL_TTL: Duration = Duration::from_secs(300);
 
-/// ロックを「古い」とみなす経過時間。取得 1 回(リトライ込み)より十分長く取る。
+/// ロックを「古い」とみなす経過時間。異常終了などで残ったロックを奪う頻度の目安であり、
+/// 重複取得を完全に防ぐ値ではない。待ち手は `LOCK_WAIT`(8 秒)で待つのをやめて自分で取得に
+/// 進むため、取得が `LOCK_WAIT` を超えて長引けば(通信の再試行など)、この値をいくら長くしても
+/// 重複取得は起き得る。それは DESIGN で許容している(正しさには影響しない)。長くすると、
+/// 残骸のロックに対して待ち手が毎回 `LOCK_WAIT` 待つ時間を延ばすだけなので 60 秒に留める。
+/// 奪われた後に元の保持者が解放しても、トークン照合により相手のロックは消えない。
 const LOCK_STALE: Duration = Duration::from_secs(60);
 
 /// 他セッションの取得完了を待つ最大時間。
@@ -86,13 +91,36 @@ pub struct Cache {
 /// ロックの解放(Drop で削除)。
 pub struct LockGuard {
     path: PathBuf,
+    /// 作成時にロックファイルへ書いた一意の値(プロセス ID・時刻・通番。秘密ではない)。
+    /// 古いと判断されて他セッションに奪われた後に、相手のロックを誤って消さないための照合用。
+    token: String,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // 失敗しても次回の古いロック判定で回収されるため無視してよい。
-        let _ = fs::remove_file(&self.path);
+        // 中身が自分のトークンと一致するときだけ削除する。奪われた(別のトークンに置き換わった)
+        // ロックは相手のものなので触らない。読めない場合も削除しない
+        // (残っても次回の古いロック判定で回収されるため無視してよい)。
+        // 照合から削除までの間に奪われる競合は残るが、その場合も「重複して取得する」だけで済む。
+        if fs::read_to_string(&self.path).is_ok_and(|c| c == self.token) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// ロックごとに一意で、秘密ではないトークンを作る(プロセス ID + ナノ秒 + プロセス内通番)。
+fn new_lock_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// キーとして安全なファイル名へ変換する(英数字と `.-_` 以外は `_`)。
@@ -166,10 +194,17 @@ impl Cache {
             std::thread::current().id()
         ));
         let io = |e: std::io::Error| VigiliaError::Io(format!("{}: {e}", tmp.display()));
-        {
-            let mut f = fs::File::create(&tmp).map_err(io)?;
-            f.write_all(&json).map_err(io)?;
+        // 作成・書き込みのどこで失敗しても一時ファイルを残さない(ディスクフル等で
+        // 途中まで書けたファイルがキャッシュ置き場に溜まり続けるのを防ぐ)。
+        let written = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&json)?;
             f.sync_all().ok();
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(io(e));
         }
         // Windows の rename は既存ファイルを置換する。読み手が掴んでいて失敗した場合は短くリトライ。
         let mut last = None;
@@ -195,7 +230,17 @@ impl Cache {
         let path = self.lock_path(key);
         for _ in 0..2 {
             match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Some(LockGuard { path }),
+                Ok(mut f) => {
+                    let token = new_lock_token();
+                    if f.write_all(token.as_bytes()).is_err() {
+                        // 中身を書けないロックは照合できず解放もできないため、作り直さず
+                        // 取り除いて「ロック無し」で進める(重複取得を許容)。
+                        drop(f);
+                        let _ = fs::remove_file(&path);
+                        return None;
+                    }
+                    return Some(LockGuard { path, token });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if lock_is_stale(&path) {
                         let _ = fs::remove_file(&path);
@@ -359,6 +404,36 @@ mod tests {
             .unwrap();
         drop(f);
         assert!(c.try_lock("old").is_some(), "古いロックは奪える");
+    }
+
+    #[test]
+    fn 奪われたロックは解放時に消さない() {
+        let dir = test_dir("stolen");
+        let c = Cache::new(dir.clone()).unwrap();
+        let g = c.try_lock("k").expect("取得できる");
+        let p = dir.join("k.lock");
+        // 自分のロックにはトークンが書かれている。
+        assert!(!fs::read_to_string(&p).unwrap().is_empty());
+        // 古いと判断されて他セッションに奪われた状態を再現(別のトークンで置き換わる)。
+        fs::remove_file(&p).unwrap();
+        fs::write(&p, "other-session-token").unwrap();
+        drop(g);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "other-session-token",
+            "相手のロックを消してはいけない"
+        );
+        // 自分のロックなら従来どおり解放で消える。
+        let _ = fs::remove_file(&p);
+        let g = c.try_lock("k").expect("再取得できる");
+        drop(g);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn ロックの古さ判定は待ち手の待機より長い() {
+        // 待ち手が LOCK_WAIT 待つ間に、生きている取得役のロックを古いと誤判定して奪わないこと。
+        assert!(LOCK_WAIT < LOCK_STALE);
     }
 
     #[test]

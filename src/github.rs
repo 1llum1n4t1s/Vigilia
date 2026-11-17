@@ -25,7 +25,7 @@ const RATE_LIMIT_URL: &str = "https://api.github.com/rate_limit";
 /// レート制限に当たったが待ち時間が分からないときの既定待機。
 const DEFAULT_RATE_WAIT: Duration = Duration::from_secs(60);
 
-/// 一時的な失敗(通信エラー・5xx)の最大試行回数。
+/// 一時的な失敗(通信エラー・5xx)の最大試行回数。再試行は 2 回(待ちは 1 秒・2 秒)。
 const MAX_ATTEMPTS: u32 = 3;
 
 // sha 起点: checkSuites を 1 クエリで取得する。
@@ -197,17 +197,9 @@ impl Client {
             }
             Target::Run(id) => {
                 let v = self.graphql(RUN_QUERY, json!({ "id": legacy_run_node_id(*id) }))?;
-                let snap = model::parse_run_response(&v, *id)?;
-                if let Some((o, n)) = repo {
-                    let want = format!("{o}/{n}");
-                    if !snap.repo.eq_ignore_ascii_case(&want) {
-                        return Err(VigiliaError::Usage(format!(
-                            "run {id} は {} のものです(--repo {want} と一致しません)",
-                            snap.repo
-                        )));
-                    }
-                }
-                Ok(snap)
+                // `--repo` との一致検査は、キャッシュ命中時も通すため Resolver 側で行う
+                // (`service.rs` の `check_repo`)。
+                model::parse_run_response(&v, *id)
             }
         }
     }

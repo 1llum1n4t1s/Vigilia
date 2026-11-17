@@ -129,6 +129,59 @@ try {
     $goodSum = $routes["/9.9.9/$winName.sha256"]
 
     if ($IsWindows) {
+    # --- install.ps1: ユーザー PATH の合成（純関数。実レジストリには触れない） ---------------------------
+    # Windows だけで実行する（RegistryValueKind と %VAR% 展開は Windows の挙動を前提にするため、macOS / Linux の CI では通さない）。
+    # install.ps1 から Get-UserPathUpdate の定義だけを AST で取り出して実行する（スクリプト本体は走らせない）。
+    Write-Host 'install.ps1: ユーザー PATH の合成（展開・種別保持・重複判定。レジストリは読み書きしない）'
+    $psTokens = $null; $psErrors = $null
+    $psAst = [Management.Automation.Language.Parser]::ParseFile($installPs1, [ref]$psTokens, [ref]$psErrors)
+    Assert-That (@($psErrors).Count -eq 0) 'install.ps1 は構文として解釈できる'
+    $pathFnAst = $psAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-UserPathUpdate' }, $true) | Select-Object -First 1
+    Assert-That ($null -ne $pathFnAst) 'install.ps1 に Get-UserPathUpdate がある'
+    $pathFnText = $pathFnAst.Extent.Text
+    . ([scriptblock]::Create($pathFnText))
+    $kExpand = [Microsoft.Win32.RegistryValueKind]::ExpandString
+    $kString = [Microsoft.Win32.RegistryValueKind]::String
+    $savedTestBin = $env:VIGILIA_TEST_BIN
+    $env:VIGILIA_TEST_BIN = 'C:\VigiliaTest\bin'
+    try {
+        $u = Get-UserPathUpdate $true '%VIGILIA_TEST_BIN%;C:\Tools' $kExpand 'C:\New\Vigilia'
+        Assert-That ($u.Value -ceq '%VIGILIA_TEST_BIN%;C:\Tools;C:\New\Vigilia') '既存の項目は展開せずそのまま残して末尾へ追加する'
+        Assert-That ($u.Kind -eq $kExpand) '元の値種別（REG_EXPAND_SZ）を保つ'
+        $u = Get-UserPathUpdate $true 'C:\Tools' $kString 'C:\New\Vigilia'
+        Assert-That ($u.Kind -eq $kString -and $u.Value -ceq 'C:\Tools;C:\New\Vigilia') '元が REG_SZ なら REG_SZ のまま書き戻す'
+        $u = Get-UserPathUpdate $false '' $null 'C:\New\Vigilia'
+        Assert-That ($u.Value -ceq 'C:\New\Vigilia' -and $u.Kind -eq $kExpand) '値が無ければ REG_EXPAND_SZ で新規に作る'
+        $u = Get-UserPathUpdate $true 'C:\A;' $kExpand 'C:\New\Vigilia'
+        Assert-That ($u.Value -ceq 'C:\A;C:\New\Vigilia') '末尾の区切りは重ねない'
+        $u = Get-UserPathUpdate $true '' $kExpand 'C:\New\Vigilia'
+        Assert-That ($u.Value -ceq 'C:\New\Vigilia') '空の値には項目だけを入れる'
+        Assert-That ($null -eq (Get-UserPathUpdate $true 'C:\Tools;C:\New\Vigilia\' $kExpand 'c:\new\VIGILIA')) '末尾の \ と大文字小文字の違いは重複とみなす'
+        Assert-That ($null -eq (Get-UserPathUpdate $true '%VIGILIA_TEST_BIN%;C:\Tools' $kExpand 'c:\vigiliatest\BIN\')) '環境変数を展開した結果が同じなら重複とみなす（追加しない）'
+        Assert-That ($null -eq (Get-UserPathUpdate $true 'C:\Tools;C:\VigiliaTest\bin' $kExpand '%VIGILIA_TEST_BIN%')) '追加する側が環境変数参照でも展開して比べる'
+        $threw = $false
+        try { Get-UserPathUpdate $true 'C:\Tools' ([Microsoft.Win32.RegistryValueKind]::DWord) 'C:\New' | Out-Null } catch { $threw = $true }
+        Assert-That $threw '文字列型でない Path の値は壊さずに止まる'
+    } finally {
+        if ($null -eq $savedTestBin) { Remove-Item Env:VIGILIA_TEST_BIN -ErrorAction SilentlyContinue } else { $env:VIGILIA_TEST_BIN = $savedTestBin }
+    }
+    # Windows PowerShell 5.1 でも同じ結果になること（導入先は 5.1 のことが多い）。
+    $ps51Path = Get-Command powershell.exe -ErrorAction SilentlyContinue
+    if ($ps51Path -and $IsWindows) {
+        $ps51Script = Join-Path $WorkDirectory 'ps51-path.ps1'
+        $ps51Body = @(
+            '$env:VIGILIA_TEST_BIN = ''C:\VigiliaTest\bin''',
+            $pathFnText,
+            '$u = Get-UserPathUpdate $true ''%VIGILIA_TEST_BIN%;C:\Tools'' ([Microsoft.Win32.RegistryValueKind]::ExpandString) ''C:\New\Vigilia''',
+            'Write-Output ("add=" + $u.Value + "|" + $u.Kind)',
+            '$d = Get-UserPathUpdate $true ''%VIGILIA_TEST_BIN%;C:\Tools'' ([Microsoft.Win32.RegistryValueKind]::ExpandString) ''c:\vigiliatest\BIN\''',
+            'Write-Output ("dup=" + ($null -eq $d))'
+        ) -join "`n"
+        [IO.File]::WriteAllText($ps51Script, $ps51Body, [Text.UTF8Encoding]::new($false))
+        $out = & $ps51Path.Source -NoProfile -ExecutionPolicy Bypass -File $ps51Script 2>&1 | Out-String
+        Assert-That ($out -match 'add=%VIGILIA_TEST_BIN%;C:\\Tools;C:\\New\\Vigilia\|ExpandString' -and $out -match 'dup=True') 'powershell.exe 5.1 でも同じ結果になる'
+    }
+
     Write-Host 'install.ps1: latest.json 解決（署名の検査まで進んで止まる）'
     $r = Invoke-InstallPs1 @()
     Assert-That ($r.ExitCode -ne 0 -and $r.Output -match 'Checksum OK' -and $r.Output -match 'Untrusted signature') 'latest -> 取得・SHA-256 照合を通り、署名の検査で止まる'
@@ -181,6 +234,28 @@ try {
     $cmd = "`$c = Get-Content -Raw -LiteralPath '$installPs1'; try { & ([scriptblock]::Create(`$c)) -Version 9.9.9 -BaseUrl '$prefix' -InstallDir '$target' -NoPath } catch { Write-Output `$_.Exception.Message }; Write-Output ('leak=' + [bool](Get-Variable ExpectedSigner -ErrorAction SilentlyContinue))"
     $out = & pwsh -NoProfile -Command $cmd 2>&1 | Out-String
     Assert-That ($out -match 'Checksum OK' -and $out -match 'Untrusted signature' -and $out -match 'leak=False') 'script block 形式で -Version を渡せ、変数をスコープに残さない'
+    # `irm | iex` 相当: 引数を渡せず、スクリプト文字列を Invoke-Expression で実行する。既定値だけで動くこと
+    # （BaseUrl は文字列置換でモックへ向け、LOCALAPPDATA は作業フォルダーへ向けて、実際の導入先には触れない）。
+    # 安全のため、置換後のスクリプトが本番 URL を含まずモックの URL を含むことを実行前に検査する。置換が空振りすると
+    # 本物の署名済み zip を取得して実際の PATH を書き換え得るので、満たさなければ失敗させて実行しない。
+    # （iex 経路では -NoPath を渡せない。実行しても署名の検査で止まる前提なので、この検査が唯一の防壁になる。）
+    $prodUrl = 'https://vigilia.kagayoi.com'
+    $iexText = ([IO.File]::ReadAllText($installPs1)).Replace($prodUrl, $prefix.TrimEnd('/'))
+    $iexSafe = (-not $iexText.Contains($prodUrl)) -and $iexText.Contains($prefix.TrimEnd('/'))
+    Assert-That $iexSafe 'iex 用に置換したスクリプトは本番 URL を含まず、モックの URL を含む（満たさなければ iex の検査は実行しない）'
+    $iexFile = Join-Path $WorkDirectory 'install-iex.ps1.txt'
+    if ($iexSafe) { [IO.File]::WriteAllText($iexFile, $iexText, [Text.UTF8Encoding]::new($false)) }
+    foreach ($shell in @(@{ Name = 'pwsh'; Exe = 'pwsh' }, @{ Name = 'powershell.exe 5.1'; Exe = 'powershell.exe' })) {
+        if (-not $iexSafe) { break }
+        if (-not (Get-Command $shell.Exe -ErrorAction SilentlyContinue)) { Write-Host "  skip $($shell.Name) が無いため iex の検査は省略"; continue }
+        $iexLocal = Join-Path $WorkDirectory ('iex-localappdata-' + $shell.Exe)
+        New-Item -ItemType Directory -Path $iexLocal -Force | Out-Null
+        # 子プロセス側でも実行直前に本番 URL が残っていないことを確かめる（残っていれば実行しない）。
+        $cmd = "`$env:LOCALAPPDATA = '$iexLocal'; `$c = Get-Content -Raw -LiteralPath '$iexFile'; if (`$c.Contains('$prodUrl')) { Write-Output 'ABORT: production URL present'; exit 3 }; try { Invoke-Expression `$c } catch { Write-Output `$_.Exception.Message }; Write-Output ('leak=' + [bool](Get-Variable ExpectedSigner -ErrorAction SilentlyContinue))"
+        $out = & $shell.Exe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
+        Assert-That ($out -match 'Checksum OK' -and $out -match 'Untrusted signature' -and $out -match 'leak=False') "irm | iex 相当（引数なし・既定値）でも取得・照合を通り、署名の検査で止まる（$($shell.Name)）"
+        Assert-That (-not (Test-Path -LiteralPath (Join-Path $iexLocal 'Programs\Vigilia'))) "署名の検査で止まるときは導入先を作らない（$($shell.Name)）"
+    }
     }
 
     # --- install.sh（bash と tar があり、bash が WSL でない環境だけ） --------------------------------

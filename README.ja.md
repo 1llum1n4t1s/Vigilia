@@ -94,7 +94,7 @@ $ vigilia watch e8c8bb3
 結論: 失敗 (1llum1n4t1s/CleanReload @ e8c8bb3)
 ```
 
-`watch` は状態が変わった job だけを出力します。`status` は全 job を 1 回表示し、`--json` で機械可読にできます。
+`watch` は状態が変わった job だけを出力します。`status` は全 job を 1 回表示し、`--json` で機械可読にできます(`overall` / `source` / `age_secs` / `filter` / `snapshot`)。レート制限中に古いキャッシュしか得られないときは、見出しが結論ではなく「結論: 未確定(レート制限中の古い断面: …)」になり、`--json` は `overall` が null になって、古い断面から計算した値は追加フィールド `stale_overall` に入ります(`source` は `stale-cache`、終了コードは 5)。
 
 ## コマンド
 
@@ -106,7 +106,7 @@ vigilia budget [--json]
 ```
 
 - 対象は **run id**(数字 9 桁以上)または **コミット SHA**(16 進 7〜40 桁、短縮可)。省略または `HEAD` でカレントの `HEAD`。
-- `--repo` を省略するとカレントの git remote(`origin` 優先、github.com のみ)から推定します。run id のときは不要です。
+- `--repo` を省略するとカレントの git remote(`origin` 優先、github.com のみ。ポート 443 の SSH 用 `ssh.github.com` は github.com として扱い、GitHub Enterprise のホストは扱いません)から推定します。run id のときは不要です。
 - SHA を指定すると、そのコミットの全 check suite(ワークフロー)をまとめて監視し、すべて完了した時点で結論を出します。
   複数 suite の結論は 失敗 > 取消 > 成功 の優先順です。
 - `budget` は REST / GraphQL / search の残り枠とリセット時刻を、枠を消費せずに表示します。
@@ -133,7 +133,7 @@ $ vigilia runs abeebf669a1fbb239d7bf537c88293d0b98177af --repo 1llum1n4t1s/Vigil
 ```
 
 - 絞り込み: `--workflow`(一致規則は上と同じ。複数の workflow に一致してもエラーにせず全て出す)、`--event`、`--since <RFC 3339>`(その時刻以後に作成された run。作成時刻が不明な run は除外)。
-- `--wait <秒>` は、条件に合う run が現れるまで最大その秒数待ちます(既定 0 は 1 回だけ取得)。`--interval` 秒ごと(既定 10、5 以上)に取得し、レート制限の待機とキャッシュ共有は `watch` と同じ仕組みです。現れなければ終了コード 7(`--json` では `[]` を出力)。run が 1 件でも見つかれば、結論に関わらず終了コード 0 です(`runs` は成否を判定しません)。
+- `--wait <秒>` は、条件に合う run が現れるまで最大その秒数待ちます(既定 0 は 1 回だけ取得)。`--interval` 秒ごと(既定 10、5 以上)に取得し、レート制限の待機とキャッシュ共有は `watch` と同じ仕組みです。現れなければ終了コード 7(`--json` では `[]` を出力)。ただし check suite が切り捨てられていて一致が 0 件の場合は「無い」と断定できないため、待たずに即、終了コード 2 のエラーにします(上限を超えた suite は待っても見えないため)。run が 1 件でも見つかれば、結論に関わらず終了コード 0 です(`runs` は成否を判定しません)。
 - `--json` は作成時刻の新しい順(同時刻は run id の大きい順)の配列で、並びは決定的です。要素は `run_id` / `run_number` / `run_attempt` / `workflow` / `workflow_path`(動的 workflow は null)/ `event` / `status` / `conclusion`(`gh` と同じ小文字表記: `completed`・`success` など。実行中の `conclusion` は null)/ `created_at` / `url` / `head_sha` / `branch`(ブランチ起点でなければ null)です。
 - `runs` は完了済みでも `--ttl` を超えてキャッシュを使い回さないため、新しい run やブランチ先頭の移動を拾えます。
 
@@ -170,9 +170,9 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 
 - リクエストは常に直列で、`watch` の取得間隔は 5 秒以上に制限しています。
 - `Retry-After` / `x-ratelimit-reset` を尊重します。`watch` は制限に当たっても落ちず、示された時間だけ待って再開します
-  (`--timeout` を超えそうなら終了コード 5 で返します)。`status` は終了コード 5 で返します。
-- GraphQL の `RATE_LIMITED`(HTTP 200 で返る場合)も同様に扱います。制限中に古いキャッシュがあれば警告付きでそれを返します。
-- 通信エラーと 5xx は最大 3 回、指数バックオフで再試行します。
+  (`--timeout` を超えそうなら終了コード 5 で返します)。`status` は、キャッシュが無ければ終了コード 5、古いキャッシュがあれば警告付きでその断面を表示したうえで終了コード 5 で返します(古い断面を結論としては扱いません)。
+- GraphQL の `RATE_LIMITED`(HTTP 200 で返る場合)も同様に扱います。制限中に古いキャッシュがあれば警告付きで表示します。`watch` は表示しますが、それを根拠に結論(完了・未検出)を確定せず、待って再取得します。
+- 通信エラーと 5xx は最大 3 回試行します(再試行 2 回、待ちは 1 秒・2 秒)。
 
 ## キャッシュ
 
@@ -188,7 +188,9 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
   REST を使わずに run id から引ける経路がこれしかないためです。将来廃止された場合は run id 指定だけが API エラーになります
   (SHA 指定は影響を受けません)。
 - 1 コミットあたり check suite は 50 件、1 suite あたり check run は 30 件(run id 指定は 50 件)まで取得します。
-  suite が上限を超えて成功に見える場合は成功と断定せずエラー(終了コード 2)にし、job の超過は「一部を省略」と表示します。
+  suite が上限を超えているときは、取りこぼした suite が結論を覆し得るため、成功・取消・run なしは断定せずエラー(終了コード 2)にします。
+  失敗は、絞り込みなしなら確定できますが、`--workflow` / `--event` で絞り込んだ後は(新しい run を取りこぼした可能性があるため)エラーです。
+  `runs` は一致する run があれば 0 を返し、取りこぼしがあれば stderr に注記します(一致が 0 件なら 7 ではなくエラーの終了コード 2)。job の超過は「一部を省略」と表示します。
 - check run を持たない非 Actions アプリの check suite は、完了しないことがあるため監視対象から除外します。
 
 ## 開発

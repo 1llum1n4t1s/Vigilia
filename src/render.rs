@@ -2,7 +2,7 @@
 //!
 //! 標準出力は AI エージェントも読むため、1 job = 1 行、装飾なしを基本にする。
 
-use crate::model::{Job, RunInfo, Snapshot, Suite};
+use crate::model::{Job, Overall, RunInfo, Snapshot, Suite};
 use chrono::{DateTime, Local, Utc};
 
 /// status / conclusion を日本語の短いラベルにする。
@@ -72,14 +72,24 @@ pub fn job_elapsed(job: &Job, now: DateTime<Utc>) -> Option<String> {
     Some(fmt_secs((end - start.with_timezone(&Utc)).num_seconds()))
 }
 
-/// 完全な状態表示(`status` 用)。
-pub fn render_snapshot(snap: &Snapshot, now: DateTime<Utc>) -> String {
+/// 見出しの結論表記。古いキャッシュ(`stale`)の断面は現在の結論ではないため、
+/// 「結論: 成功」とは読めない表記にする(終了コード 5 と食い違わせない)。
+pub fn conclusion_text(overall: Overall, stale: bool) -> String {
+    if stale {
+        format!("未確定(レート制限中の古い断面: {})", overall.label())
+    } else {
+        overall.label().to_string()
+    }
+}
+
+/// 完全な状態表示(`status` 用)。`stale` は古いキャッシュの断面であること。
+pub fn render_snapshot(snap: &Snapshot, now: DateTime<Utc>, stale: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{} @ {}  結論: {}\n",
         snap.repo,
         short_sha(&snap.sha),
-        snap.overall().label()
+        conclusion_text(snap.overall(), stale)
     ));
     if snap.suites.is_empty() {
         out.push_str("  (run / check suite はまだありません)\n");
@@ -152,7 +162,7 @@ pub fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
 
-/// epoch 秒をローカル時刻 + UTC 表記にする(例: `2026-11-16 21:51 JST (12:51 UTC)`)。
+/// epoch 秒をローカル時刻 + UTC 表記にする(例: `2026-11-16 21:51 +09:00 (12:51 UTC)`。`%Z` はローカルのオフセット表記になる)。
 pub fn fmt_reset(epoch: i64) -> String {
     match DateTime::<Utc>::from_timestamp(epoch, 0) {
         Some(utc) => {
@@ -181,6 +191,32 @@ mod tests {
         assert_eq!(fmt_secs(65), "1m05s");
         assert_eq!(fmt_secs(3700), "1h01m");
         assert_eq!(fmt_secs(-3), "0s");
+    }
+
+    #[test]
+    fn 古い断面の見出しは結論と読めない表記になる() {
+        let snap = Snapshot {
+            repo: "o/r".into(),
+            sha: "abcdef0123".into(),
+            suites: vec![Suite {
+                run_id: Some(1),
+                status: "COMPLETED".into(),
+                conclusion: Some("SUCCESS".into()),
+                ..Default::default()
+            }],
+            truncated: false,
+            suites_truncated: false,
+            cost: None,
+        };
+        let now = Utc::now();
+        let fresh = render_snapshot(&snap, now, false);
+        assert!(fresh.starts_with("o/r @ abcdef0  結論: 成功\n"), "{fresh}");
+        let stale = render_snapshot(&snap, now, true);
+        assert!(
+            stale.starts_with("o/r @ abcdef0  結論: 未確定(レート制限中の古い断面: 成功)\n"),
+            "{stale}"
+        );
+        assert!(!stale.contains("結論: 成功"), "{stale}");
     }
 
     #[test]

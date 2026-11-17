@@ -113,18 +113,35 @@ fn is_cancel_conclusion(c: &str) -> bool {
 }
 
 impl Snapshot {
-    /// 結論を返す。ただし check suite が切り捨てられた状態で「成功」とは断定できないため、
-    /// その場合はエラーにする(取りこぼした suite が失敗している可能性がある)。
-    pub fn conclusive_overall(&self) -> Result<Overall> {
+    /// 結論を返す。ただし check suite が切り捨てられた状態では、取りこぼした suite が
+    /// 結論を覆し得るため、確定できないものはエラーにする。`filtered` は `--workflow` /
+    /// `--event` で絞り込んだ後の断面か(絞り込みは「同じ (workflow, event) の最新 1 件」だけを
+    /// 残すため、取りこぼした suite が新しい run である可能性を排除できない)。
+    ///
+    /// 切り捨てがあるときの扱い:
+    /// - 成功 / 取消 / run なし: 取りこぼした suite が失敗・実行中かもしれないのでエラー。
+    /// - 失敗: 絞り込みなし(全 suite の集約)なら、残りの suite が何であれ失敗は覆らないので確定。
+    ///   絞り込み後は、取りこぼした新しい run に取って代わられ得るのでエラー。
+    /// - 実行中: まだ結論ではないのでそのまま返す。
+    pub fn conclusive_overall(&self, filtered: bool) -> Result<Overall> {
         let overall = self.overall();
-        if self.suites_truncated && overall == Overall::Success {
-            return Err(VigiliaError::Api(
-                "check suite が取得上限(50 件)を超えており、成功と断定できません。\
-                 GitHub の画面で確認してください"
-                    .into(),
-            ));
+        if !self.suites_truncated {
+            return Ok(overall);
         }
-        Ok(overall)
+        let reason = match overall {
+            Overall::InProgress => return Ok(overall),
+            Overall::Failure if !filtered => return Ok(overall),
+            Overall::Success => "成功と断定できません",
+            Overall::Cancelled => "取消と断定できません",
+            Overall::NoRuns => "run が無いと断定できません",
+            Overall::Failure => {
+                "絞り込み後の最新 run を取りこぼした可能性があり、失敗と断定できません"
+            }
+        };
+        Err(VigiliaError::Api(format!(
+            "check suite が取得上限(50 件)を超えており、{reason}。\
+             GitHub の画面で確認してください"
+        )))
     }
 
     /// 全 suite を畳み込んだ結論。
@@ -541,8 +558,10 @@ fn convert_suite(raw: RawSuite) -> (Suite, bool) {
 }
 
 /// GraphQL レスポンス(JSON 値)の `errors` を評価してエラーへ変換する。
-/// `data` が得られている部分的エラーは呼び出し側で扱うため、ここでは
-/// 「致命的(data が無い)」ときと「レート制限」だけを返す。
+/// `data` 付きで Ok にするのは、errors の type が**すべて** NOT_FOUND のときだけ
+/// (対象が欠けるだけの部分的エラー。欠けた対象は後段の parse_* が判定する)。
+/// 1 件でも別の type(権限・内部エラー等)が混ざれば、data があっても Api エラーにする。
+/// RATE_LIMITED が含まれていれば常にそれを優先する。
 pub fn check_gql_errors(value: &serde_json::Value) -> Result<()> {
     let errors: Vec<GqlError> = match value.get("errors") {
         Some(e) => serde_json::from_value(e.clone()).unwrap_or_default(),
@@ -574,11 +593,18 @@ pub fn check_gql_errors(value: &serde_json::Value) -> Result<()> {
         .collect::<Vec<_>>()
         .join("; ");
     // NOT_FOUND は repository / node が null になるだけで data 自体は返るため、
-    // 後段(parse_*)で対象が欠けていることを判定する。ここでは data 無しだけ致命扱い。
-    if errors.iter().any(|e| e.kind.as_deref() == Some("NOT_FOUND")) && has_data {
+    // 後段(parse_*)で対象が欠けていることを判定する。ただし他の type が混ざる
+    // 部分的エラーは、data の一部が欠けた不完全な応答かもしれないので通さない。
+    if has_data
+        && errors
+            .iter()
+            .all(|e| e.kind.as_deref() == Some("NOT_FOUND"))
+    {
         return Ok(());
     }
-    if errors.iter().any(|e| e.kind.as_deref() == Some("NOT_FOUND")) {
+    // data が無く NOT_FOUND を含む場合は、対象が存在しない(または権限が無い)として扱う。
+    // data があって別 type が混ざる場合は上で通らず、ここも通さず Api エラーにする。
+    if !has_data && errors.iter().any(|e| e.kind.as_deref() == Some("NOT_FOUND")) {
         return Err(VigiliaError::NotFound(msg));
     }
     Err(VigiliaError::Api(msg))
@@ -742,15 +768,43 @@ mod tests {
         snap.suites[0].status = "COMPLETED".into();
         snap.suites[0].conclusion = Some("SUCCESS".into());
         snap.suites_truncated = true;
-        assert!(matches!(snap.conclusive_overall(), Err(VigiliaError::Api(_))));
-        // 失敗は切り捨てがあっても確定できる。
+        assert!(matches!(snap.conclusive_overall(false), Err(VigiliaError::Api(_))));
+        assert!(matches!(snap.conclusive_overall(true), Err(VigiliaError::Api(_))));
+        // 絞り込みなしの失敗は、取りこぼした suite が何であっても覆らないので確定できる。
         snap.suites[0].conclusion = Some("FAILURE".into());
-        assert_eq!(snap.conclusive_overall().unwrap(), Overall::Failure);
+        assert_eq!(snap.conclusive_overall(false).unwrap(), Overall::Failure);
         // pageInfo の hasNextPage から検知される。
         let mut v = commit_fixture();
         v["data"]["repository"]["object"]["checkSuites"]["pageInfo"]["hasNextPage"] =
             serde_json::json!(true);
         assert!(parse_commit_response(&v, "x").unwrap().suites_truncated);
+    }
+
+    #[test]
+    fn suite切り捨て時の取消とrunなしと絞り込み後の失敗も断定しない() {
+        let mut snap = parse_commit_response(&commit_fixture(), "x").unwrap();
+        snap.suites_truncated = true;
+        // 取消: 取りこぼした suite が失敗・実行中かもしれない。
+        snap.suites[0].status = "COMPLETED".into();
+        snap.suites[0].conclusion = Some("CANCELLED".into());
+        assert!(matches!(snap.conclusive_overall(false), Err(VigiliaError::Api(_))));
+        // run なし(絞り込みの有無によらず)。
+        let mut empty = snap.clone();
+        empty.suites.clear();
+        assert!(matches!(empty.conclusive_overall(false), Err(VigiliaError::Api(_))));
+        assert!(matches!(empty.conclusive_overall(true), Err(VigiliaError::Api(_))));
+        // 絞り込み後の失敗は、取りこぼした新しい run に取って代わられ得るのでエラー。
+        snap.suites[0].conclusion = Some("FAILURE".into());
+        assert!(matches!(snap.conclusive_overall(true), Err(VigiliaError::Api(_))));
+        // 実行中は結論ではないのでそのまま返す(待機を続けられる)。
+        snap.suites[0].status = "IN_PROGRESS".into();
+        snap.suites[0].conclusion = None;
+        assert_eq!(snap.conclusive_overall(true).unwrap(), Overall::InProgress);
+        // 切り捨てが無ければ従来どおり。
+        snap.suites_truncated = false;
+        snap.suites[0].status = "COMPLETED".into();
+        snap.suites[0].conclusion = Some("CANCELLED".into());
+        assert_eq!(snap.conclusive_overall(true).unwrap(), Overall::Cancelled);
     }
 
     #[test]
@@ -796,6 +850,31 @@ mod tests {
         assert!(matches!(
             parse_run_response(&v, 1),
             Err(VigiliaError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn notfoundだけならdata付きで通し別typeが混ざればapiエラー() {
+        // NOT_FOUND だけ + data あり: 後段が対象の欠落を判定する。
+        let v = json!({"data":{"repository":{"nameWithOwner":"a/b","object":null}},"errors":[
+            {"type":"NOT_FOUND","message":"x"}]});
+        assert!(check_gql_errors(&v).is_ok());
+        // 別 type が 1 件でも混ざれば、data があっても不完全な応答として Api エラー。
+        let mixed = json!({"data":{"repository":{"nameWithOwner":"a/b","object":null}},"errors":[
+            {"type":"NOT_FOUND","message":"x"},
+            {"type":"FORBIDDEN","message":"権限なし"}]});
+        assert!(matches!(check_gql_errors(&mixed), Err(VigiliaError::Api(_))));
+        assert!(matches!(
+            parse_commit_response(&mixed, "x"),
+            Err(VigiliaError::Api(_))
+        ));
+        // RATE_LIMITED が混ざれば引き続きそれを優先する。
+        let rl = json!({"data":{"repository":null},"errors":[
+            {"type":"NOT_FOUND","message":"x"},
+            {"type":"RATE_LIMITED","message":"limit"}]});
+        assert!(matches!(
+            check_gql_errors(&rl),
+            Err(VigiliaError::RateLimited { .. })
         ));
     }
 
@@ -954,7 +1033,7 @@ mod tests {
         let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
         let s = snap.filtered(&wf("nope.yml")).unwrap();
         assert_eq!(s.overall(), Overall::NoRuns);
-        assert!(s.conclusive_overall().is_ok());
+        assert!(s.conclusive_overall(true).is_ok());
     }
 
     #[test]

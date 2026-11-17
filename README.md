@@ -86,7 +86,7 @@ $ vigilia watch e8c8bb3
 結論: 失敗 (1llum1n4t1s/CleanReload @ e8c8bb3)
 ```
 
-Command output is in Japanese. `watch` prints only the jobs whose state changed; `status` prints every job once, and `--json` makes it machine readable.
+Command output is in Japanese. `watch` prints only the jobs whose state changed; `status` prints every job once, and `--json` makes it machine readable (`overall`, `source`, `age_secs`, `filter`, `snapshot`). When only a stale cache is available under rate limiting, the text heading reads "結論: 未確定(レート制限中の古い断面: ...)" instead of a conclusion, and `--json` sets `overall` to null and puts the value computed from the stale snapshot in an extra field `stale_overall` (`source` is `stale-cache`; the exit code is 5).
 
 ## Commands
 
@@ -98,7 +98,7 @@ vigilia budget [--json]
 ```
 
 - The target is a **run id** (9 or more digits) or a **commit SHA** (7 to 40 hex digits, abbreviations allowed). Omitting it or passing `HEAD` uses the current `HEAD`.
-- Without `--repo`, the repository is inferred from the current git remote (`origin` first, github.com only). It is not needed for a run id.
+- Without `--repo`, the repository is inferred from the current git remote (`origin` first, github.com only; `ssh.github.com:443` SSH remotes count as github.com, GitHub Enterprise hosts are not supported). It is not needed for a run id.
 - With a SHA, Vigilia watches every check suite (workflow) of that commit and concludes once all have finished. When several suites disagree, the result is failure > cancelled > success.
 - `budget` prints the remaining REST, GraphQL and search quota and the reset times, without consuming any.
 
@@ -124,7 +124,7 @@ $ vigilia runs abeebf669a1fbb239d7bf537c88293d0b98177af --repo 1llum1n4t1s/Vigil
 ```
 
 - Filters: `--workflow` (same matching as above; a value matching several workflows lists all of them), `--event`, and `--since <RFC 3339>` (runs created at or after that time; a run without a creation time is excluded).
-- `--wait <secs>` waits up to that long for a matching run to appear (default 0: fetch once). It polls every `--interval` seconds (default 10, minimum 5), honors rate-limit waits and shares the cache. If no run appears, the exit code is 7 (and `[]` is printed with `--json`). With one or more runs found, the exit code is 0 whatever their conclusions are; `runs` does not judge success.
+- `--wait <secs>` waits up to that long for a matching run to appear (default 0: fetch once). It polls every `--interval` seconds (default 10, minimum 5), honors rate-limit waits and shares the cache. If no run appears, the exit code is 7 (and `[]` is printed with `--json`); if check suites were truncated (see Limitations) and nothing matches, "no match" cannot be asserted and it is an error (exit code 2) at once, without waiting (suites past the limit never become visible by waiting). With one or more runs found, the exit code is 0 whatever their conclusions are; `runs` does not judge success.
 - `--json` prints an array sorted by creation time, newest first (then run id, descending), so it is deterministic. Each element has `run_id`, `run_number`, `run_attempt`, `workflow`, `workflow_path` (null for dynamic workflows), `event`, `status` and `conclusion` (lower case like `gh`: `completed`, `success`, ...; `conclusion` is null while running), `created_at`, `url`, `head_sha` and `branch` (null when not triggered by a branch).
 - `runs` never reuses a finished snapshot for longer than `--ttl`, so a new run or a moved branch tip is picked up.
 
@@ -160,9 +160,9 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 ## Rate limits
 
 - Requests are always sequential, and the `watch` interval is limited to 5 seconds or more.
-- `Retry-After` and `x-ratelimit-reset` are honored. `watch` does not abort when it is rate limited: it waits for the indicated time and resumes (it returns exit code 5 if that would exceed `--timeout`). `status` returns exit code 5.
-- A GraphQL `RATE_LIMITED` error (which arrives with HTTP 200) is handled the same way. While limited, a stale cached snapshot is returned with a warning if one exists.
-- Network errors and 5xx responses are retried up to 3 times with exponential backoff.
+- `Retry-After` and `x-ratelimit-reset` are honored. `watch` does not abort when it is rate limited: it waits for the indicated time and resumes (it returns exit code 5 if that would exceed `--timeout`). `status` returns exit code 5 if there is no cache, and also if only a stale cache exists (the stale snapshot is printed with a warning, but it is never reported as a conclusion).
+- A GraphQL `RATE_LIMITED` error (which arrives with HTTP 200) is handled the same way. While limited, a stale cached snapshot is shown with a warning if one exists. `watch` prints it but does not conclude from it (neither a finished result nor "no run found"): it waits and fetches again.
+- Network errors and 5xx responses are tried up to 3 times in total (2 retries, waiting 1 s and 2 s).
 
 ## Caching
 
@@ -174,7 +174,7 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 ## Limitations
 
 - Resolving a run id to a run uses the legacy global ID format that GitHub has deprecated (`011:WorkflowRun<id>`), because it is the only way to look up a run by id without REST. If it is removed in the future, only run id targets will fail with an API error; SHA targets are unaffected.
-- At most 50 check suites per commit and 30 check runs per suite (50 for a run id target) are fetched. If suites exceed the limit and everything seen looks successful, Vigilia reports an error (exit code 2) instead of claiming success; exceeding the job limit is shown as partially omitted.
+- At most 50 check suites per commit and 30 check runs per suite (50 for a run id target) are fetched. If suites exceed the limit, missed suites could change the conclusion, so success, cancelled and "no run" are reported as an error (exit code 2) instead of being claimed. A failure is still reported without a filter, but after `--workflow` / `--event` it is also an error (a newer run may have been missed). `runs` still exits 0 when a matching run is found and prints a note to stderr when suites were missed; with no match it is an error (exit code 2), not 7. Exceeding the job limit is shown as partially omitted.
 - Check suites of non-Actions apps that have no check runs may never complete, so they are excluded from watching.
 
 ## Development

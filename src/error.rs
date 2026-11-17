@@ -18,7 +18,8 @@ pub mod exit {
     pub const CANCELLED: i32 = 3;
     /// `watch` が `--timeout` で打ち切られた。
     pub const TIMEOUT: i32 = 4;
-    /// レート制限に当たり、待っても結論を得られなかった。
+    /// レート制限に当たり、待っても結論を得られなかった(`status` が古いキャッシュしか
+    /// 得られなかった場合を含む。その断面は警告付きで表示される)。
     pub const RATE_LIMITED: i32 = 5;
     /// `status` で対象がまだ実行中・待機中。
     pub const IN_PROGRESS: i32 = 6;
