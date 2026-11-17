@@ -31,7 +31,7 @@ error.rs: VigiliaError と終了コード（全層で共有）
 
 ## データフロー
 
-1. `target.rs` が引数を `Target::Run(id)` か `Target::Sha(sha)` に分類する。数字のみ9桁以上は run id、16進7〜40桁は SHA。`HEAD`・省略は `git rev-parse HEAD`。SHA のときの repo は `--repo`、なければ git remote（`origin` 優先、github.com のみ）から推定する。run id には repo を要求しない。
+1. `target.rs` が引数を `Target::Run(id)` か `Target::Sha(sha)` に分類する(`runs` だけはそれ以外の文字列を `Target::Branch` として受ける)。数字のみ9桁以上は run id、16進7〜40桁は SHA。`HEAD`・省略は `git rev-parse HEAD`。SHA のときの repo は `--repo`、なければ git remote（`origin` 優先、github.com のみ）から推定する。run id には repo を要求しない。
 2. `Resolver::get()` がキャッシュキー（`run__<id>` または `<owner>__<repo>__sha__<sha>`）で `cache.get_or_lock()` を呼ぶ。
    - 新鮮なエントリがあれば返す（`Source::Cache`）。
    - なければロックを取り、ダブルチェックしたうえで GraphQL を1回実行し、結果を書き込む（`Source::Api`）。
