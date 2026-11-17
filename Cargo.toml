@@ -1,8 +1,10 @@
 [package]
 name = "vigilia"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
-description = "GitHub REST 枠を使わず GraphQL で CI 状態を見張り、結果を全セッションで共有するツール"
+description = "Watch GitHub Actions through GraphQL without spending the REST rate limit, and share the result across sessions."
+license = "MIT"
+repository = "https://github.com/1llum1n4t1s/Vigilia"
 publish = false
 
 [profile.release]
