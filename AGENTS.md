@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Vigilia は、GitHub Actions の状態を GraphQL で取得し、ファイルキャッシュで複数セッションに共有する Rust 製 CLI（単一クレート `vigilia`、edition 2024）。
-目的・構成・設計判断は [DESIGN.md](DESIGN.md)、利用者向けの使い方は [README.md](README.md) を参照する。
+目的・構成・設計判断は [DESIGN.md](DESIGN.md)、利用者向けの使い方は [README.md](README.md)（英語）と [README.ja.md](README.ja.md)（日本語）を参照する。README は両言語を同じ内容に揃えて更新する。変更履歴は [CHANGELOG.md](CHANGELOG.md)（日本語）に版ごとにまとめる。
 
 ## 必須コマンド
 
@@ -13,7 +13,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-- `Cargo.lock` はコミット対象。CI は `--locked` なので、依存を変えたら lock も更新する。
+- `Cargo.lock` はコミット対象。CI は `--locked` なので、依存を変えたら lock も更新する。版は `Cargo.toml` の `version` が正本で、上げるときは `Cargo.lock` と CHANGELOG.md も揃える。
 - `publish = false`。リリース配信は未整備（`[profile.release]` は lto・strip で単一バイナリを小さく保つ）。
 
 ## 構成（`src/`）
