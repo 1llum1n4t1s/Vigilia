@@ -4,7 +4,7 @@
 Vigilia の配布アーカイブ（4 ターゲット）を Cloudflare R2（vigilia-updates / https://vigilia.kagayoi.com）へ配信する。
 
 .DESCRIPTION
-release.yml（release/* ブランチの push）の publish ジョブから呼ぶ。GitHub Release もタグも使わず、R2 を唯一の配布元にする。
+release.yml（版タグ v<版> の push）の publish ジョブから呼ぶ。GitHub Release は使わず、R2 を唯一の配布元にする。
 お手本は Sigilune の scripts/Publish-R2.ps1。違いは、ターゲットが複数（OS・CPU 別）で latest.json が各ターゲットを表す点だけ。
 
 置き場（バケット直下）:
