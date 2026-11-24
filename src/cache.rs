@@ -21,10 +21,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 完了済み(結果が変わらない)スナップショットを再利用してよい時間。
-/// 再実行(re-run)で変わり得るため無期限にはしない。
-pub const TERMINAL_TTL: Duration = Duration::from_secs(300);
-
 /// ロックを「古い」とみなす経過時間。異常終了などで残ったロックを奪う頻度の目安であり、
 /// 重複取得を完全に防ぐ値ではない。待ち手は `LOCK_WAIT`(8 秒)で待つのをやめて自分で取得に
 /// 進むため、取得が `LOCK_WAIT` を超えて長引けば(通信の再試行など)、この値をいくら長くしても
@@ -35,6 +31,9 @@ const LOCK_STALE: Duration = Duration::from_secs(60);
 
 /// 他セッションの取得完了を待つ最大時間。
 const LOCK_WAIT: Duration = Duration::from_secs(8);
+
+// 待ち手が LOCK_WAIT 待つ間に、生きている取得役のロックを古いと誤判定して奪わないこと。
+const _: () = assert!(LOCK_WAIT.as_secs() < LOCK_STALE.as_secs());
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Entry {
@@ -61,26 +60,10 @@ impl Entry {
         Duration::from_millis(now_ms.saturating_sub(self.fetched_at_ms))
     }
 
-    /// `ttl` 以内、または完了済みで `TERMINAL_TTL` 以内なら新鮮とみなす。
-    #[cfg(test)]
+    /// `ttl` 以内なら新鮮とみなす。完了済みでも延長しない(再実行で run id のまま結果が
+    /// 変わり得るため、結論の確定は再利用の根拠にならない)。
     pub fn is_fresh(&self, now_ms: u64, ttl: Duration) -> bool {
-        self.is_fresh_with(now_ms, ttl, &|s| s.overall().is_terminal())
-    }
-
-    /// `is_fresh` の一般形。「完了済みとみなして TERMINAL_TTL まで再利用してよいか」を
-    /// 呼び出し側が決める。workflow で絞った監視や `runs` では、絞る前の全体が完了していても
-    /// 「待っている run がまだ現れていない」だけの場合があり、古い結果を使い回すと見逃すため。
-    pub fn is_fresh_with(
-        &self,
-        now_ms: u64,
-        ttl: Duration,
-        terminal: &dyn Fn(&Snapshot) -> bool,
-    ) -> bool {
-        let age = self.age(now_ms);
-        if age <= ttl {
-            return true;
-        }
-        terminal(&self.snapshot) && age <= TERMINAL_TTL.max(ttl)
+        self.age(now_ms) <= ttl
     }
 }
 
@@ -257,21 +240,16 @@ impl Cache {
 
     /// 新鮮なキャッシュを返す。無ければ他セッションの取得を待って再確認する。
     /// 戻り値の第 2 要素は、呼び出し側が取得を行うべき場合の保持ロック。
-    pub fn get_or_lock(
-        &self,
-        key: &str,
-        ttl: Duration,
-        terminal: &dyn Fn(&Snapshot) -> bool,
-    ) -> (Option<Entry>, Option<LockGuard>) {
+    pub fn get_or_lock(&self, key: &str, ttl: Duration) -> (Option<Entry>, Option<LockGuard>) {
         if let Some(e) = self.read(key)
-            && e.is_fresh_with(now_ms(), ttl, terminal)
+            && e.is_fresh(now_ms(), ttl)
         {
             return (Some(e), None);
         }
         if let Some(guard) = self.try_lock(key) {
             // ロック取得の間に他セッションが書き込んだ可能性があるため再確認(ダブルチェック)。
             if let Some(e) = self.read(key)
-                && e.is_fresh_with(now_ms(), ttl, terminal)
+                && e.is_fresh(now_ms(), ttl)
             {
                 return (Some(e), None);
             }
@@ -282,7 +260,7 @@ impl Cache {
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(250));
             if let Some(e) = self.read(key)
-                && e.is_fresh_with(now_ms(), ttl, terminal)
+                && e.is_fresh(now_ms(), ttl)
             {
                 return (Some(e), None);
             }
@@ -343,49 +321,20 @@ mod tests {
     }
 
     #[test]
-    fn 書いて読める_キーは安全化される() {
-        let c = Cache::new(test_dir("rw")).unwrap();
-        assert!(c.read("o/r:abc").is_none());
-        c.write("o/r:abc", &snap("IN_PROGRESS", None)).unwrap();
-        let e = c.read("o/r:abc").unwrap();
-        assert_eq!(e.snapshot.repo, "o/r");
-        assert_eq!(sanitize_key("o/r:abc"), "o_r_abc");
-    }
-
-    #[test]
-    fn ttlの新鮮さ判定() {
-        let e = Entry {
-            version: 1,
-            fetched_at_ms: 1_000_000,
-            snapshot: snap("IN_PROGRESS", None),
-        };
-        let ttl = Duration::from_secs(15);
-        assert!(e.is_fresh(1_000_000 + 14_000, ttl));
-        assert!(!e.is_fresh(1_000_000 + 16_000, ttl));
-        // 時計が戻っていても新鮮扱い(age=0)。
-        assert!(e.is_fresh(999_000, ttl));
-        // 完了済みは TTL を超えても TERMINAL_TTL までは新鮮。
-        let done = Entry {
-            version: 1,
-            fetched_at_ms: 1_000_000,
-            snapshot: snap("COMPLETED", Some("SUCCESS")),
-        };
-        assert!(done.is_fresh(1_000_000 + 200_000, ttl));
-        assert!(!done.is_fresh(1_000_000 + 301_000, ttl));
-    }
-
-    #[test]
     fn 壊れたファイルは無視される() {
         let dir = test_dir("corrupt");
         let c = Cache::new(dir.clone()).unwrap();
         fs::write(dir.join("k.json"), b"{ not json").unwrap();
         assert!(c.read("k").is_none());
         // 版違いも無視。
-        fs::write(
-            dir.join("v.json"),
-            br#"{"version":99,"fetched_at_ms":1,"snapshot":null}"#,
-        )
-        .unwrap();
+        // 正常に書いた JSON の version だけを書き換える(復号自体は成功する形)。
+        c.write("v", &snap("COMPLETED", Some("SUCCESS"))).unwrap();
+        assert!(c.read("v").is_some());
+        let p = dir.join("v.json");
+        let text = fs::read_to_string(&p).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        json["version"] = serde_json::json!(99);
+        fs::write(&p, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(c.read("v").is_none());
     }
 
@@ -431,23 +380,26 @@ mod tests {
     }
 
     #[test]
-    fn ロックの古さ判定は待ち手の待機より長い() {
-        // 待ち手が LOCK_WAIT 待つ間に、生きている取得役のロックを古いと誤判定して奪わないこと。
-        assert!(LOCK_WAIT < LOCK_STALE);
-    }
-
-    #[test]
     fn 新鮮ならロックせずキャッシュを返す() {
         let c = Cache::new(test_dir("fresh")).unwrap();
-        c.write("k", &snap("IN_PROGRESS", None)).unwrap();
-        let (hit, guard) = c.get_or_lock("k", Duration::from_secs(15), &|s| s.overall().is_terminal());
+        // 完了済みの断面でも、TTL を超えたら再取得させる(再実行の結果を見逃さないため)ので、
+        // 完了済みで確かめる。
+        c.write("k", &snap("COMPLETED", Some("SUCCESS"))).unwrap();
+        let (hit, guard) = c.get_or_lock("k", Duration::from_secs(15));
         assert!(hit.is_some());
         assert!(guard.is_none());
-        // 古い(ttl=0)場合はロック付きで取得を促す。
+        // TTL を超えた場合は(完了済みでも)キャッシュを返さず、ロック付きで取得を促す。
         std::thread::sleep(Duration::from_millis(5));
-        let (hit, guard) = c.get_or_lock("k", Duration::from_millis(0), &|s| s.overall().is_terminal());
+        let (hit, guard) = c.get_or_lock("k", Duration::from_millis(0));
         assert!(hit.is_none());
         assert!(guard.is_some());
+        // 時計が戻っていても経過は 0 として扱う(新鮮扱い)。
+        let e = Entry {
+            version: 1,
+            fetched_at_ms: 1_000_000,
+            snapshot: snap("IN_PROGRESS", None),
+        };
+        assert!(e.is_fresh(999_000, Duration::from_secs(15)));
     }
 
     #[test]
@@ -475,7 +427,10 @@ mod tests {
             std::thread::spawn(move || {
                 let mut ok = 0;
                 for _ in 0..400 {
-                    if let Some(e) = c.read("k") {
+                    // 読み取り Err(Windows の共有違反)は許容。読めたなら必ず復号できる。
+                    if let Ok(bytes) = fs::read(c.entry_path("k")) {
+                        let e: Entry = serde_json::from_slice(&bytes)
+                            .expect("読めた内容は必ず Entry として復号できる");
                         assert_eq!(e.snapshot.repo, "o/r");
                         ok += 1;
                     }

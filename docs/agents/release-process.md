@@ -14,6 +14,6 @@
 - R2 の置き場: `<版>/vigilia-<版>-<ターゲット>.zip`（Windows）・`.tar.gz`（macOS / Linux）と `.sha256`（版付き・不変・`public, max-age=31536000, immutable`）、最後に `latest.json`（固定名・`no-cache, must-revalidate`、形式は `scripts/Publish-R2.ps1` の冒頭を参照）。版付きは新規作成のみで、同内容なら成功・別内容なら失敗する。公開 URL から取り直して照合してから `latest.json` を置く。公開中の `latest.json` がより新しい版なら更新しない。
 - GitHub の設定: Environment `release`（許可 ref は版タグ `v[0-9]*.[0-9]*.[0-9]*`（type: tag）だけ、承認者なし）に Secrets `SIGILUNE_EMAIL` / `SIGILUNE_TOTP_URI`（署名）と `CLOUDFLARE_API_TOKEN`（配信。R2 の書込みとキャッシュ purge 権限）を置く。Secrets は sign-windows の署名 step と publish の配信 step にだけ渡し、build・梱包・検証 step には渡さない。Cloudflare のアカウント ID は秘密ではなく `Publish-R2.ps1` の既定値に持つ。
 - Cloudflare 側: R2 バケット `vigilia-updates` を作り、カスタムドメイン `vigilia.kagayoi.com`（zone `kagayoi.com`）を割り当てる。
-- `install.ps1` / `install.sh` / `scripts/Publish-R2.ps1` / `scripts/R2*` を変えたら `pwsh -NoProfile -File tests/Test-Install.ps1` を通す（R2 にも Certum にも接続しない）。`R2Transfer.Core.cs` と `R2Distribution.Common.ps1` は Sigilune・Edictora・Skilvella と共通の同梱コピーなので、片方だけ直さない。
-- `release.yml` の配信 step で `$LASTEXITCODE` を見ない。`Publish-R2.ps1` は失敗を例外で知らせ、成功後もスクリプト内部の終了コードが残るため、見ると誤って失敗扱いになる。
+- `install.ps1` / `install.sh` / `scripts/Publish-R2.ps1` / `scripts/R2*` / `tests/Test-Install.ps1` を変えたら `pwsh -NoProfile -File tests/Test-Install.ps1` を通す（R2 にも Certum にも接続しない）。`R2Transfer.Core.cs` と `R2Distribution.Common.ps1` は Sigilune・Edictora・Skilvella と共通の同梱コピーなので、片方だけ直さない。
+- `release.yml` の配信 step で `$LASTEXITCODE` を見ない。`Publish-R2.ps1` は失敗を例外だけで知らせるので、`$LASTEXITCODE` を判定に使わない（成功時は 0 へ戻す）。
 - 配布物のビルドはキャッシュを使わない（`ci.yml` と違い rust-cache を付けない）。再ビルドは同じ版でもバイト列が変わるため、配信済みの版を別のビルドで上書きしようとすると失敗する。配信だけやり直すときは publish ジョブだけを再実行する。

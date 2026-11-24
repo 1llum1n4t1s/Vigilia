@@ -6,6 +6,7 @@ Back to [README](../../README.md).
 git push
 vigilia watch HEAD      # wait until every workflow for HEAD finishes
 vigilia status HEAD     # print the current state once
+vigilia runs HEAD       # list the workflow runs
 vigilia budget          # show remaining REST / GraphQL / search quota
 ```
 

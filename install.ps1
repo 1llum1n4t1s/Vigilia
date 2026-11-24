@@ -144,6 +144,14 @@ param(
         if (-not $defaultInstallDir) { throw 'LOCALAPPDATA is not set, so the default install folder cannot be determined. Pass -InstallDir.' }
         $InstallDir = $defaultInstallDir
     }
+    # Make the folder absolute against the PowerShell location, and accept only file system paths. A relative
+    # path would otherwise resolve against the process directory, and a provider path such as HKCU:\ is not a folder.
+    $provider = $null
+    $drive = $null
+    $InstallDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir, [ref]$provider, [ref]$drive)
+    if ($provider.Name -ne 'FileSystem' -or ($InstallDir -notmatch '^[A-Za-z]:\\' -and $InstallDir -notmatch '^\\\\')) {
+        throw "InstallDir must be a file system path on a drive or a UNC path: $InstallDir"
+    }
     $isDefaultInstallDir = [bool]$defaultInstallDir -and ([IO.Path]::GetFullPath($InstallDir).TrimEnd('\') -ieq [IO.Path]::GetFullPath($defaultInstallDir).TrimEnd('\'))
     # Windows PowerShell 5.1 may default to TLS 1.0, so enable TLS 1.2.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12

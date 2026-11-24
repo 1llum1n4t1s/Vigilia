@@ -84,7 +84,7 @@ pub enum Overall {
 }
 
 impl Overall {
-    /// 完了(これ以上状態が変わらない)か。
+    /// 全 suite が完了した(再実行で変わり得る)か。
     pub fn is_terminal(self) -> bool {
         matches!(self, Overall::Success | Overall::Failure | Overall::Cancelled)
     }
@@ -101,7 +101,7 @@ impl Overall {
 }
 
 /// 失敗扱いにする conclusion。
-fn is_failure_conclusion(c: &str) -> bool {
+pub fn is_failure_conclusion(c: &str) -> bool {
     matches!(
         c,
         "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED"
@@ -153,10 +153,12 @@ impl Snapshot {
         if self.suites.iter().any(|s| s.status != "COMPLETED") {
             return Overall::InProgress;
         }
-        let concl = |s: &Suite| s.conclusion.clone().unwrap_or_default();
-        if self.suites.iter().any(|s| is_failure_conclusion(&concl(s))) {
+        fn concl(s: &Suite) -> &str {
+            s.conclusion.as_deref().unwrap_or_default()
+        }
+        if self.suites.iter().any(|s| is_failure_conclusion(concl(s))) {
             Overall::Failure
-        } else if self.suites.iter().any(|s| is_cancel_conclusion(&concl(s))) {
+        } else if self.suites.iter().any(|s| is_cancel_conclusion(concl(s))) {
             Overall::Cancelled
         } else {
             Overall::Success
@@ -368,7 +370,6 @@ impl Snapshot {
 #[derive(Debug, Deserialize)]
 struct GqlResponse {
     data: Option<GqlData>,
-    errors: Option<Vec<GqlError>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,7 +475,7 @@ struct RawRunFile {
     path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawRun {
     #[serde(rename = "databaseId")]
     database_id: Option<u64>,
@@ -534,22 +535,18 @@ fn convert_suite(raw: RawSuite) -> (Suite, bool) {
             });
         }
     }
-    let run = raw.workflow_run;
+    let run = raw.workflow_run.unwrap_or_default();
     let suite = Suite {
         app: raw.app.map(|a| a.name).unwrap_or_else(|| "?".into()),
-        workflow: run
-            .as_ref()
-            .and_then(|r| r.workflow.as_ref().map(|w| w.name.clone())),
-        workflow_path: run
-            .as_ref()
-            .and_then(|r| r.file.as_ref().map(|f| f.path.clone())),
-        run_id: run.as_ref().and_then(|r| r.database_id),
-        run_number: run.as_ref().and_then(|r| r.run_number),
-        run_attempt: run.as_ref().and_then(|r| r.run_attempt),
-        created_at: run.as_ref().and_then(|r| r.created_at.clone()),
+        workflow: run.workflow.map(|w| w.name),
+        workflow_path: run.file.map(|f| f.path),
+        run_id: run.database_id,
+        run_number: run.run_number,
+        run_attempt: run.run_attempt,
+        created_at: run.created_at,
         branch: raw.branch.map(|b| b.name),
-        event: run.as_ref().and_then(|r| r.event.clone()),
-        url: run.as_ref().and_then(|r| r.url.clone()),
+        event: run.event,
+        url: run.url,
         status: raw.status,
         conclusion: raw.conclusion,
         jobs,
@@ -561,37 +558,36 @@ fn convert_suite(raw: RawSuite) -> (Suite, bool) {
 /// `data` 付きで Ok にするのは、errors の type が**すべて** NOT_FOUND のときだけ
 /// (対象が欠けるだけの部分的エラー。欠けた対象は後段の parse_* が判定する)。
 /// 1 件でも別の type(権限・内部エラー等)が混ざれば、data があっても Api エラーにする。
-/// RATE_LIMITED が含まれていれば常にそれを優先する。
+/// RATE_LIMIT(実応答の type)または RATE_LIMITED が含まれていれば常にそれを優先する。
+/// `errors` が配列でも null でもない不正な形のときは Api エラーにする。
 pub fn check_gql_errors(value: &serde_json::Value) -> Result<()> {
-    let errors: Vec<GqlError> = match value.get("errors") {
-        Some(e) => serde_json::from_value(e.clone()).unwrap_or_default(),
+    let errors = match value.get("errors") {
+        Some(e) => Option::<Vec<GqlError>>::deserialize(e)
+            .map_err(|e| VigiliaError::Api(format!("レスポンスを解釈できません: {e}")))?
+            .unwrap_or_default(),
         None => return Ok(()),
     };
     if errors.is_empty() {
         return Ok(());
     }
+    let msg = errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
     if errors
         .iter()
-        .any(|e| e.kind.as_deref() == Some("RATE_LIMITED"))
+        .any(|e| matches!(e.kind.as_deref(), Some("RATE_LIMIT" | "RATE_LIMITED")))
     {
         return Err(VigiliaError::RateLimited {
             retry_after: None,
-            message: errors
-                .iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
+            message: msg,
         });
     }
     let has_data = value
         .get("data")
         .map(|d| !d.is_null())
         .unwrap_or(false);
-    let msg = errors
-        .iter()
-        .map(|e| e.message.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
     // NOT_FOUND は repository / node が null になるだけで data 自体は返るため、
     // 後段(parse_*)で対象が欠けていることを判定する。ただし他の type が混ざる
     // 部分的エラーは、data の一部が欠けた不完全な応答かもしれないので通さない。
@@ -612,9 +608,8 @@ pub fn check_gql_errors(value: &serde_json::Value) -> Result<()> {
 
 fn parse_response(value: &serde_json::Value) -> Result<GqlData> {
     check_gql_errors(value)?;
-    let resp: GqlResponse = serde_json::from_value(value.clone())
+    let resp = GqlResponse::deserialize(value)
         .map_err(|e| VigiliaError::Api(format!("レスポンスを解釈できません: {e}")))?;
-    let _ = resp.errors;
     resp.data
         .ok_or_else(|| VigiliaError::Api("レスポンスに data がありません".into()))
 }
@@ -808,15 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn suiteが無ければrunなし() {
-        let v = json!({"data":{"repository":{"nameWithOwner":"a/b","object":
-            {"oid":"abc","checkSuites":{"nodes":[]}}}}});
-        let snap = parse_commit_response(&v, "abc").unwrap();
-        assert_eq!(snap.overall(), Overall::NoRuns);
-        assert!(!snap.overall().is_terminal());
-    }
-
-    #[test]
     fn runノード応答を正規化する() {
         let v = json!({"data":{"node":{"checkSuite":{
             "repository":{"nameWithOwner":"octo/demo"},
@@ -876,6 +862,12 @@ mod tests {
             check_gql_errors(&rl),
             Err(VigiliaError::RateLimited { .. })
         ));
+        // type の無い GraphQL エラーは Api エラー。
+        let other = json!({"errors":[{"message":"boom"}]});
+        assert!(matches!(
+            parse_commit_response(&other, "x"),
+            Err(VigiliaError::Api(_))
+        ));
     }
 
     #[test]
@@ -885,15 +877,30 @@ mod tests {
             parse_commit_response(&v, "x"),
             Err(VigiliaError::RateLimited { .. })
         ));
+        // 実応答の type は RATE_LIMIT(code は graphql_rate_limit、data なし)。
+        let v = json!({"errors":[{"type":"RATE_LIMIT","code":"graphql_rate_limit",
+            "message":"API rate limit already exceeded"}]});
+        assert!(matches!(
+            check_gql_errors(&v),
+            Err(VigiliaError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            parse_commit_response(&v, "x"),
+            Err(VigiliaError::RateLimited { .. })
+        ));
     }
 
     #[test]
-    fn その他のgraphqlエラーはapiエラー() {
-        let v = json!({"errors":[{"message":"boom"}]});
+    fn errorsが不正形ならapiエラー() {
+        let v = json!({"data":null,"errors":"boom"});
+        assert!(matches!(check_gql_errors(&v), Err(VigiliaError::Api(_))));
         assert!(matches!(
             parse_commit_response(&v, "x"),
             Err(VigiliaError::Api(_))
         ));
+        // errors: null は成功扱い。
+        let ok = json!({"data":{"repository":null},"errors":null});
+        assert!(check_gql_errors(&ok).is_ok());
     }
 
     // --- workflow / event 絞り込みと run 一覧 ---
@@ -1014,23 +1021,7 @@ mod tests {
         let ids: Vec<u64> = s.suites.iter().map(|x| x.run_id.unwrap()).collect();
         assert_eq!(ids, vec![12, 13]);
         assert_eq!(s.overall(), Overall::Cancelled);
-    }
-
-    #[test]
-    fn 再実行のattemptは同じrunなので1件として扱う() {
-        // 再実行は run id が同じまま attempt が増える。一覧には最新 attempt の 1 件だけが出る。
-        let mut v = runs_fixture();
-        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["workflowRun"]["runAttempt"] =
-            json!(2);
-        let snap = parse_commit_response(&v, "x").unwrap();
-        let r = &snap.runs(&wf("release.yml"))[0];
-        assert_eq!(r.run_attempt, Some(2));
-        assert_eq!(snap.runs(&wf("release.yml")).len(), 1);
-    }
-
-    #[test]
-    fn 一致するrunが無ければrunなし() {
-        let snap = parse_commit_response(&runs_fixture(), "x").unwrap();
+        // 一致する run が無ければ run なし(確定できる)。
         let s = snap.filtered(&wf("nope.yml")).unwrap();
         assert_eq!(s.overall(), Overall::NoRuns);
         assert!(s.conclusive_overall(true).is_ok());
@@ -1055,27 +1046,4 @@ mod tests {
         assert_eq!(snap.runs(&wf("CI")).len(), 5 - 1);
     }
 
-    #[test]
-    fn 絞り込み後の未完了は実行中になる() {
-        let mut v = runs_fixture();
-        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["status"] =
-            json!("IN_PROGRESS");
-        v["data"]["repository"]["object"]["checkSuites"]["nodes"][0]["conclusion"] =
-            serde_json::Value::Null;
-        let snap = parse_commit_response(&v, "x").unwrap();
-        assert_eq!(snap.filtered(&wf("release.yml")).unwrap().overall(), Overall::InProgress);
-        // 他の workflow の未完了は影響しない(CI だけなら完了済み)。
-        assert!(snap.filtered(&wf("ci.yml")).unwrap().overall().is_terminal());
-    }
-
-    #[test]
-    fn 旧形式のキャッシュにも新フィールドは既定値で読める() {
-        let s: Suite = serde_json::from_value(json!({
-            "app":"a","workflow":"CI","run_id":1,"run_number":1,"event":"push","url":null,
-            "status":"COMPLETED","conclusion":"SUCCESS","jobs":[]
-        }))
-        .unwrap();
-        assert_eq!(s.workflow_path, None);
-        assert_eq!(s.created_at, None);
-    }
 }

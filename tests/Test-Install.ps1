@@ -135,9 +135,8 @@ try {
     Write-Host 'install.ps1: ユーザー PATH の合成（展開・種別保持・重複判定。レジストリは読み書きしない）'
     $psTokens = $null; $psErrors = $null
     $psAst = [Management.Automation.Language.Parser]::ParseFile($installPs1, [ref]$psTokens, [ref]$psErrors)
-    Assert-That (@($psErrors).Count -eq 0) 'install.ps1 は構文として解釈できる'
+    # 構文エラーは 187 行以降の install.ps1 の全実行で、関数の欠落は次の StrictMode 下の .Extent 参照の例外で検出する。
     $pathFnAst = $psAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-UserPathUpdate' }, $true) | Select-Object -First 1
-    Assert-That ($null -ne $pathFnAst) 'install.ps1 に Get-UserPathUpdate がある'
     $pathFnText = $pathFnAst.Extent.Text
     . ([scriptblock]::Create($pathFnText))
     $kExpand = [Microsoft.Win32.RegistryValueKind]::ExpandString
@@ -214,6 +213,13 @@ try {
     Write-Host 'install.ps1: HTTPS 限定'
     $out = & pwsh -NoProfile -File $installPs1 -BaseUrl 'http://example.com' -InstallDir (Join-Path $WorkDirectory 'install-http') -NoPath 2>&1 | Out-String
     Assert-That ($LASTEXITCODE -ne 0 -and $out -match 'BaseUrl must be https') '非ループバックの http は拒否する'
+    # ダウンロードの前に止まるため、レジストリへは何も書かれない（導入先の絶対化で検出される）。
+    foreach ($exe in 'pwsh', 'powershell.exe') {
+        if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { continue }
+        $requests.Clear()
+        $out = & $exe -NoProfile -ExecutionPolicy Bypass -File $installPs1 -BaseUrl $prefix -InstallDir 'HKCU:\Software\VigiliaInstallDirTest' -NoPath 2>&1 | Out-String
+        Assert-That ($LASTEXITCODE -ne 0 -and $out -match 'InstallDir must be a file system path' -and $requests.Count -eq 0) "ファイルシステム以外の InstallDir は取得前に拒否する（$exe）"
+    }
 
     Write-Host 'install.ps1: Windows PowerShell 5.1 と配布時の呼び出し方'
     # install.ps1 は保存して 5.1 で実行されるため ASCII だけにしてある（BOM なし UTF-8 の日本語は CP932 として読まれ、改行を巻き込む）。
@@ -266,10 +272,13 @@ try {
         $bashOk = $uname -match '^(Linux|Darwin|MINGW|MSYS)' -and (-not $IsWindows -or $uname -match '^(MINGW|MSYS)')
     }
     if ($bashOk) {
+        # install.sh の契約は POSIX sh（案内は `| sh`）。bashism の混入を見つけるため、非 Windows では sh で実行する（Windows は Git Bash）。
+        $shName = if ($IsWindows) { 'bash' } else { 'sh' }
+        $shExe = if ($IsWindows) { $bash.Source } else { (Get-Command sh -ErrorAction Stop).Source }
         function Invoke-InstallSh([string[]]$ExtraArgs) {
             $requests.Clear()
             $target = Join-Path $WorkDirectory ('install-sh-' + [guid]::NewGuid().ToString('N'))
-            $out = & $bash.Source $installSh --base-url $prefix --install-dir $target --target x86_64-unknown-linux-gnu @ExtraArgs 2>&1 | Out-String
+            $out = & $shExe $installSh --base-url $prefix --install-dir $target --target x86_64-unknown-linux-gnu @ExtraArgs 2>&1 | Out-String
             return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out; Requests = @($requests.ToArray()); Dir = $target }
         }
         Write-Host 'install.sh: 正常系'
@@ -303,16 +312,16 @@ try {
         $routes['/latest.json'] = New-Feed '9.9.9' $dist
 
         Write-Host 'install.sh: 制限'
-        $out = & $bash.Source $installSh --base-url 'http://user:pw@127.0.0.1:1' --install-dir (Join-Path $WorkDirectory 'sh-userinfo') --target x86_64-unknown-linux-gnu 2>&1 | Out-String
+        $out = & $shExe $installSh --base-url 'http://user:pw@127.0.0.1:1' --install-dir (Join-Path $WorkDirectory 'sh-userinfo') --target x86_64-unknown-linux-gnu 2>&1 | Out-String
         Assert-That ($LASTEXITCODE -ne 0 -and $out -match 'user information') 'userinfo 付きの URL は拒否する'
-        $out = & $bash.Source $installSh --help 2>&1 | Out-String
+        $out = & $shExe $installSh --help 2>&1 | Out-String
         Assert-That ($LASTEXITCODE -eq 0 -and $out -match '--target TRIPLE' -and $out -match '-h, --help') '--help が最後まで表示される'
         $shPath = $installSh.Replace([string][char]92, '/')
-        $out = & $bash.Source -c "unset HOME; VIGILIA_INSTALL_DIR= bash '$shPath' --base-url '$prefix' --target x86_64-unknown-linux-gnu" 2>&1 | Out-String
+        $out = & $bash.Source -c "unset HOME; VIGILIA_INSTALL_DIR= $shName '$shPath' --base-url '$prefix' --target x86_64-unknown-linux-gnu" 2>&1 | Out-String
         Assert-That ($LASTEXITCODE -ne 0 -and $out -match 'install directory') 'HOME も VIGILIA_INSTALL_DIR も空なら止まる'
-        $out = & $bash.Source $installSh --base-url 'http://example.com' --install-dir (Join-Path $WorkDirectory 'sh-http') --target x86_64-unknown-linux-gnu 2>&1 | Out-String
+        $out = & $shExe $installSh --base-url 'http://example.com' --install-dir (Join-Path $WorkDirectory 'sh-http') --target x86_64-unknown-linux-gnu 2>&1 | Out-String
         Assert-That ($LASTEXITCODE -ne 0 -and $out -match 'must be https') '非ループバックの http は拒否する'
-        $out = & $bash.Source $installSh --base-url $prefix --install-dir (Join-Path $WorkDirectory 'sh-target') --target x86_64-apple-darwin 2>&1 | Out-String
+        $out = & $shExe $installSh --base-url $prefix --install-dir (Join-Path $WorkDirectory 'sh-target') --target x86_64-apple-darwin 2>&1 | Out-String
         Assert-That ($LASTEXITCODE -ne 0 -and $out -match 'unsupported target') 'Intel Mac のターゲットは拒否する'
     } else {
         Write-Host 'install.sh: bash / tar が使えないため省略'

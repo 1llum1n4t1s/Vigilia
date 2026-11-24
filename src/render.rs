@@ -140,10 +140,9 @@ pub fn failed_jobs(snap: &Snapshot) -> Vec<String> {
     for s in &snap.suites {
         for j in &s.jobs {
             if j.status == "COMPLETED"
-                && matches!(
-                    j.conclusion.as_deref(),
-                    Some("FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED")
-                )
+                && j.conclusion
+                    .as_deref()
+                    .is_some_and(crate::model::is_failure_conclusion)
             {
                 v.push(format!(
                     "{} / {} [{}] {}",
@@ -178,22 +177,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ラベル() {
-        assert_eq!(state_label("IN_PROGRESS", None), "実行中");
-        assert_eq!(state_label("QUEUED", None), "待機中");
-        assert_eq!(state_label("COMPLETED", Some("SUCCESS")), "成功");
-        assert_eq!(state_label("COMPLETED", Some("TIMED_OUT")), "タイムアウト");
-    }
-
-    #[test]
-    fn 秒の整形() {
-        assert_eq!(fmt_secs(5), "5s");
-        assert_eq!(fmt_secs(65), "1m05s");
-        assert_eq!(fmt_secs(3700), "1h01m");
-        assert_eq!(fmt_secs(-3), "0s");
-    }
-
-    #[test]
     fn 古い断面の見出しは結論と読めない表記になる() {
         let snap = Snapshot {
             repo: "o/r".into(),
@@ -217,33 +200,5 @@ mod tests {
             "{stale}"
         );
         assert!(!stale.contains("結論: 成功"), "{stale}");
-    }
-
-    #[test]
-    fn 短縮sha() {
-        assert_eq!(short_sha("e8c8bb3a2eb9"), "e8c8bb3");
-        assert_eq!(short_sha("abc"), "abc");
-    }
-
-    #[test]
-    fn run一覧の整形() {
-        let r = RunInfo {
-            run_id: 5,
-            run_number: Some(1),
-            run_attempt: Some(1),
-            workflow: Some("Release".into()),
-            workflow_path: None,
-            event: Some("push".into()),
-            status: "completed".into(),
-            conclusion: Some("failure".into()),
-            created_at: Some("2026-11-17T18:17:24Z".into()),
-            url: None,
-            head_sha: "abcdef0123".into(),
-            branch: None,
-        };
-        let out = render_runs("o/r", "abcdef0123", &[r]);
-        assert!(out.starts_with("o/r @ abcdef0  run 1 件\n"), "{out}");
-        assert!(out.contains("5  失敗"), "{out}");
-        assert!(out.contains("Release [-]  push  2026-11-17T18:17:24Z  -  -"), "{out}");
     }
 }

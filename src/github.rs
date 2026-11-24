@@ -29,9 +29,10 @@ const DEFAULT_RATE_WAIT: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 3;
 
 // sha 起点: checkSuites を 1 クエリで取得する。
-// コストは「必要なリクエスト数/100」で数えられるため、suite 50 × job 30 でも cost は小さい
-// (実測で確認すること)。超過は pageInfo で検知する。suite の切り捨ては結論を保証できないため、
-// 成功扱いにせずエラーにする(commands 側)。job の切り捨ては表示上の注意のみ。
+// コストは「必要なリクエスト数/100」で数えられるため、suite 50 × job 30 でも cost は小さい。
+// 超過は pageInfo で検知する。suite が切り捨てられた状態では、成功・取消・run なし
+// (絞り込み後は失敗も)を断定せずエラーにする(`Snapshot::conclusive_overall`)。
+// job の切り捨ては表示上の注意のみ。
 const COMMIT_QUERY: &str = r#"
 query($owner:String!,$name:String!,$expr:String!){
   repository(owner:$owner,name:$name){
@@ -143,7 +144,19 @@ impl Client {
             };
             let status = resp.status();
             let headers = resp.headers().clone();
-            let text = resp.text().unwrap_or_default();
+            // 2xx で本文を受け取れなかった場合は、送信失敗と同じく再試行する。
+            // 非 2xx は本文なしでも分類できるので、空文字のまま進める。
+            let text = match resp.text() {
+                Ok(t) => t,
+                Err(e) if status.is_success() => {
+                    if attempt < MAX_ATTEMPTS {
+                        backoff(attempt);
+                        continue;
+                    }
+                    return Err(VigiliaError::Network(strip_url(e)));
+                }
+                Err(_) => String::new(),
+            };
 
             if status.is_server_error() {
                 if attempt < MAX_ATTEMPTS {
@@ -158,7 +171,7 @@ impl Client {
             let value: Value = serde_json::from_str(&text).map_err(|e| {
                 VigiliaError::Api(format!("JSON として解釈できないレスポンスです: {e}"))
             })?;
-            // 200 でも errors に RATE_LIMITED が入るため、待ち時間をヘッダーから補う。
+            // 200 でも errors に RATE_LIMIT(RATE_LIMITED)が入るため、待ち時間をヘッダーから補う。
             return match model::check_gql_errors(&value) {
                 Err(VigiliaError::RateLimited {
                     retry_after: None,
@@ -215,7 +228,11 @@ impl Client {
             .map_err(|e| VigiliaError::Network(strip_url(e)))?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let text = resp.text().unwrap_or_default();
+        let text = match resp.text() {
+            Ok(t) => t,
+            Err(e) if status.is_success() => return Err(VigiliaError::Network(strip_url(e))),
+            Err(_) => String::new(),
+        };
         if let Some(err) = classify_http_error(status, &headers, &text) {
             return Err(err);
         }
@@ -363,10 +380,7 @@ mod tests {
             ("x-ratelimit-reset", "2000"),
         ]);
         assert_eq!(wait_from_headers(&h, 1000), Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn 残り0ならresetまでの差() {
+        // retry-after が無く残りが 0 なら reset までの差。
         let h = headers(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "1090")]);
         assert_eq!(wait_from_headers(&h, 1000), Some(Duration::from_secs(90)));
         // 既に過ぎていても最低 1 秒。

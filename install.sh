@@ -119,7 +119,17 @@ case "$TARGET" in
 esac
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/vigilia-install.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+STAGED=""
+# 終了時（正常・失敗・中断）に、導入先の一時ファイルと作業フォルダーを片付ける。
+cleanup() {
+  if [ -n "$STAGED" ]; then
+    rm -f -- "$STAGED" || :
+  fi
+  rm -rf -- "$WORK" || :
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # 200 以外（リダイレクトを含む）は失敗にする。
 fetch() {
@@ -194,8 +204,10 @@ _reported="$("$WORK/extract/vigilia" --version 2>&1)" || die "the downloaded vig
 
 # --- 配置（同じ場所へ一時名で置いてから rename し、書き込み途中の状態を見せない） -----------------
 mkdir -p "$INSTALL_DIR"
-cp "$WORK/extract/vigilia" "$INSTALL_DIR/.vigilia.new.$$"
-mv -f "$INSTALL_DIR/.vigilia.new.$$" "$INSTALL_DIR/vigilia"
+STAGED="$INSTALL_DIR/.vigilia.new.$$"
+cp "$WORK/extract/vigilia" "$STAGED"
+mv -f "$STAGED" "$INSTALL_DIR/vigilia"
+STAGED=""
 step "Installed to $INSTALL_DIR/vigilia"
 
 case ":${PATH:-}:" in

@@ -78,6 +78,7 @@ CI は Windows x64、macOS Apple Silicon、Linux でビルド・テスト・lint
 git push
 vigilia watch HEAD      # HEAD の全ワークフローが終わるまで待つ
 vigilia status HEAD     # 現在の状態を 1 回表示する
+vigilia runs HEAD       # workflow run の一覧を表示する
 vigilia budget          # REST / GraphQL / search の残り枠を表示する
 ```
 
@@ -120,7 +121,7 @@ SHA 指定は既定でそのコミットの**全 workflow**(Dependabot の run �
 - **複数の run が一致する場合**: (workflow, event) の組ごとに**最も新しい run だけ**を結論に使います(作成時刻、同時刻なら run 番号の大きい方)。新しい run に取って代わられた古い失敗は、新しい成功を隠しません。**event が違う run**(同じ workflow の `push` と `workflow_dispatch` など)は別の組として**すべて**結論に含め、失敗 > 取消 > 成功の優先順で畳み込みます。片方だけ見たいときは `--event` を併用します。再実行は run id が同じまま attempt が増えるので 1 つの run です。
 - **曖昧な指定**: 指定値が複数の別 workflow に一致する場合(例: 表示名 `CI` を持つファイルが 2 つ)は、`watch` / `status` は候補を挙げて終了コード 2 で止まります。ファイルパスで指定してください。
 - Dependabot Updates のような動的 workflow はファイルパスを持たないため、表示名でだけ指定できます。
-- キャッシュは「コミット全体」を保存し、絞り込み条件に依存しません。条件違いのセッション同士でも安全に共有できます。完了済みの再利用(最大 5 分)は**絞り込んだ後の結果**が完了しているときだけに限るので、まだ現れていない workflow を古いスナップショットで見逃すことはありません。
+- キャッシュは「コミット全体」を保存し、絞り込み条件に依存しません。条件違いのセッション同士でも安全に共有できます。キャッシュの再利用は完了済みかどうかによらず `--ttl`(既定 15 秒)以内だけなので、まだ現れていない workflow や再実行(re-run)後の結果を、それより古いスナップショットで見逃すことはありません(直後から確実に見るには `--no-cache`)。ただしレート制限中は例外で、古いキャッシュで代替し得ます(「レート制限への振る舞い」の節を参照)。
 
 ### run 一覧(`runs`)
 
@@ -135,7 +136,7 @@ $ vigilia runs abeebf669a1fbb239d7bf537c88293d0b98177af --repo 1llum1n4t1s/Vigil
 - 絞り込み: `--workflow`(一致規則は上と同じ。複数の workflow に一致してもエラーにせず全て出す)、`--event`、`--since <RFC 3339>`(その時刻以後に作成された run。作成時刻が不明な run は除外)。
 - `--wait <秒>` は、条件に合う run が現れるまで最大その秒数待ちます(既定 0 は 1 回だけ取得)。`--interval` 秒ごと(既定 10、5 以上)に取得し、レート制限の待機とキャッシュ共有は `watch` と同じ仕組みです。現れなければ終了コード 7(`--json` では `[]` を出力)。ただし check suite が切り捨てられていて一致が 0 件の場合は「無い」と断定できないため、待たずに即、終了コード 2 のエラーにします(上限を超えた suite は待っても見えないため)。run が 1 件でも見つかれば、結論に関わらず終了コード 0 です(`runs` は成否を判定しません)。
 - `--json` は作成時刻の新しい順(同時刻は run id の大きい順)の配列で、並びは決定的です。要素は `run_id` / `run_number` / `run_attempt` / `workflow` / `workflow_path`(動的 workflow は null)/ `event` / `status` / `conclusion`(`gh` と同じ小文字表記: `completed`・`success` など。実行中の `conclusion` は null)/ `created_at` / `url` / `head_sha` / `branch`(ブランチ起点でなければ null)です。
-- `runs` は完了済みでも `--ttl` を超えてキャッシュを使い回さないため、新しい run やブランチ先頭の移動を拾えます。
+- キャッシュは完了済みでも `--ttl` を超えて使い回さないため、`runs` は新しい run やブランチ先頭の移動を、`watch` / `status` は再実行後の結果を拾えます。ただしレート制限中は例外で、古いキャッシュで代替し得ます(「レート制限への振る舞い」の節を参照)。
 
 ### `gh run watch` の置き換え
 
@@ -171,7 +172,7 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 - リクエストは常に直列で、`watch` の取得間隔は 5 秒以上に制限しています。
 - `Retry-After` / `x-ratelimit-reset` を尊重します。`watch` は制限に当たっても落ちず、示された時間だけ待って再開します
   (`--timeout` を超えそうなら終了コード 5 で返します)。`status` は、キャッシュが無ければ終了コード 5、古いキャッシュがあれば警告付きでその断面を表示したうえで終了コード 5 で返します(古い断面を結論としては扱いません)。
-- GraphQL の `RATE_LIMITED`(HTTP 200 で返る場合)も同様に扱います。制限中に古いキャッシュがあれば警告付きで表示します。`watch` は表示しますが、それを根拠に結論(完了・未検出)を確定せず、待って再取得します。
+- GraphQL の `RATE_LIMIT`(旧表記 `RATE_LIMITED` も同様。HTTP 200 で返る場合)も同様に扱います。制限中に古いキャッシュがあれば警告付きで表示します。`watch` は表示しますが、それを根拠に結論(完了・未検出)を確定せず、待って再取得します。
 - 通信エラーと 5xx は最大 3 回試行します(再試行 2 回、待ちは 1 秒・2 秒)。
 
 ## キャッシュ
@@ -179,7 +180,7 @@ git push; vigilia watch HEAD; if ($LASTEXITCODE -ne 0) { "CI NG: $LASTEXITCODE" 
 - 場所: Windows `%LOCALAPPDATA%\Vigilia\cache` / macOS `~/Library/Caches/Vigilia/cache` / Linux `$XDG_CACHE_HOME/Vigilia/cache`
   (環境変数 `VIGILIA_CACHE_DIR` で変更可能)。
 - キー(repo + 対象)ごとに 1 ファイル。一時ファイルへ書いてから rename するため、読み手が壊れた内容を見ることはありません。
-- 完了済み(結論が確定)のスナップショットは最大 5 分間再利用します。`--no-cache` で無効化できます。
+- スナップショットは完了済みでも `--ttl`(既定 15 秒)以内だけ再利用します(再実行で結果が変わるため)。ただしレート制限中は例外で、古いキャッシュで代替し得ます(「レート制限への振る舞い」の節を参照)。`--no-cache` で無効化できます。
 - キャッシュは最適化であり正本ではありません。壊れた・古い・読めないファイルは無視して再取得します。
 
 ## 既知の制約

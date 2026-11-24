@@ -1,5 +1,5 @@
 # 依存と Actions を毎週月曜に確認する（Sigilune / Skilvella と同じ形式）。
-# .github/workflows の actions はコミット SHA 固定のまま更新される。
+# .github/workflows の actions はコミット SHA 固定のまま（自作の Sigilune@v1 を除く）更新される。
 version: 2
 updates:
   - package-ecosystem: cargo

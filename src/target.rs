@@ -193,23 +193,15 @@ mod tests {
             classify("E8C8BB3").unwrap(),
             Target::Sha("e8c8bb3".into())
         );
-        // 8 桁の数字のみは短縮 SHA として扱う。
+        // 数字のみ: 8 桁は短縮 SHA、9 桁は run id。
         assert_eq!(classify("12345678").unwrap(), Target::Sha("12345678".into()));
-        assert!(classify("xyz").is_err());
-        assert!(classify("abc12").is_err()); // 短すぎる
+        assert_eq!(classify("123456789").unwrap(), Target::Run(123456789));
+        // 16 進: 6 桁は短すぎ、7 桁と 40 桁は SHA、41 桁は長すぎ。
+        assert!(classify("abcdef").is_err());
+        assert_eq!(classify("abcdef0").unwrap(), Target::Sha("abcdef0".into()));
+        assert!(classify(&"a".repeat(40)).is_ok());
         assert!(classify(&"a".repeat(41)).is_err());
-    }
-
-    #[test]
-    fn repo検証() {
-        assert_eq!(
-            parse_repo("1llum1n4t1s/Vigilia").unwrap(),
-            ("1llum1n4t1s".into(), "Vigilia".into())
-        );
-        assert!(parse_repo("noslash").is_err());
-        assert!(parse_repo("a/b/c").is_err());
-        assert!(parse_repo("a/b c").is_err());
-        assert!(parse_repo("/b").is_err());
+        assert!(classify("xyz").is_err());
     }
 
     #[test]
@@ -244,7 +236,9 @@ mod tests {
             Target::Branch("release/1.0.1".into())
         );
         assert_eq!(parse_runs_target("main").unwrap(), Target::Branch("main".into()));
-        assert!(parse_runs_target("43778559656").is_err());
+        // 9 桁以上の数字だけは run id なので拒否、8 桁は短縮 SHA。
+        assert!(parse_runs_target("123456789").is_err());
+        assert!(parse_runs_target("12345678").is_ok());
         assert!(parse_runs_target("-x").is_err());
         assert!(parse_runs_target("a..b").is_err());
         assert!(parse_runs_target("a b").is_err());

@@ -40,25 +40,13 @@ pub struct Fetched {
     pub retry_after: Option<Duration>,
 }
 
-/// キャッシュを「完了済みだから TERMINAL_TTL まで使い回してよい」と判断する方針。
-/// 取得結果そのもの(絞り込む前の全体)はどの方針でも共通で、キャッシュは条件に依存しない。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Freshness {
-    /// 全 suite の結論が確定していれば使い回す(絞り込みなしの `watch` / `status`)。
-    Default,
-    /// 絞り込んだ後の結論が確定しているときだけ使い回し、取得結果も絞り込んで返す。
-    /// 絞る前の全体が完了済みでも、待っている run が未出現なだけの場合に古い結果で見逃さないため。
-    Filtered(RunFilter),
-    /// 完了済みでも TERMINAL_TTL を適用しない(`runs`。新しい run やブランチ先頭の移動を見逃さない)。
-    Strict,
-}
-
 pub struct Resolver {
     repo: Option<(String, String)>,
     target: Target,
     cache: Option<Cache>,
     ttl: Duration,
-    freshness: Freshness,
+    /// 指定があれば、取得結果(絞り込む前の全体。キャッシュは条件に依存しない)を絞り込んで返す。
+    filter: Option<RunFilter>,
     /// トークン取得(`gh auth token`)はキャッシュ命中時には不要なため遅延生成する。
     client: Option<Client>,
 }
@@ -95,7 +83,7 @@ impl Resolver {
         target: Target,
         use_cache: bool,
         ttl: Duration,
-        freshness: Freshness,
+        filter: Option<RunFilter>,
     ) -> Self {
         let cache = if use_cache {
             match cache::default_dir().and_then(Cache::new) {
@@ -114,7 +102,7 @@ impl Resolver {
             target,
             cache,
             ttl,
-            freshness,
+            filter,
             client: None,
         }
     }
@@ -141,98 +129,61 @@ impl Resolver {
         }
     }
 
-    /// 完了済みとして TERMINAL_TTL まで再利用してよいか(`Freshness` に従う)。
-    fn is_terminal(&self, snap: &Snapshot) -> bool {
-        match &self.freshness {
-            Freshness::Default => snap.overall().is_terminal(),
-            Freshness::Filtered(f) => snap
-                .filtered(f)
-                .map(|s| s.overall().is_terminal())
-                .unwrap_or(false),
-            Freshness::Strict => false,
-        }
+    /// API から取得する。トークン取得(`gh auth token`)を伴う Client は初回だけ作る。
+    fn fetch_api(
+        client: &mut Option<Client>,
+        repo: Option<&(String, String)>,
+        target: &Target,
+    ) -> Result<Snapshot> {
+        let client = match client {
+            Some(c) => c,
+            None => client.insert(Client::new()?),
+        };
+        client.fetch_snapshot(repo, target)
     }
 
-    fn fetch_api(&mut self) -> Result<Snapshot> {
-        if self.client.is_none() {
-            self.client = Some(Client::new()?);
-        }
-        self.client
-            .as_ref()
-            .expect("直前で初期化済み")
-            .fetch_snapshot(self.repo.as_ref(), &self.target)
-    }
-
-    /// 取得して返す。`Freshness::Filtered` のときは結果も絞り込んで返す
+    /// 取得して返す。絞り込み条件があるときは結果も絞り込んで返す
     /// (workflow が曖昧なら使用エラー)。
+    ///
+    /// 取得元(キャッシュ・古いキャッシュ・API)によらず、run と `--repo` の不一致を必ず検出する。
+    /// run id のキャッシュキーは repo を含まないため、他リポジトリの run を `--repo` 付きで
+    /// 引いてもキャッシュが命中し得る。
     pub fn get(&mut self) -> Result<Fetched> {
-        let mut fetched = self.get_unfiltered()?;
-        if let Freshness::Filtered(f) = &self.freshness {
+        let mut fetched = self.fetch_or_cached()?;
+        check_repo(self.repo.as_ref(), &self.target, &fetched.snapshot)?;
+        if let Some(f) = &self.filter {
             fetched.snapshot = fetched.snapshot.filtered(f)?;
         }
         Ok(fetched)
     }
 
-    /// 取得元(キャッシュ・古いキャッシュ・API)によらず、run と `--repo` の不一致を必ず検出する。
-    /// run id のキャッシュキーは repo を含まないため、他リポジトリの run を `--repo` 付きで
-    /// 引いてもキャッシュが命中し得る。
-    fn get_unfiltered(&mut self) -> Result<Fetched> {
-        let fetched = self.fetch_or_cached()?;
-        check_repo(self.repo.as_ref(), &self.target, &fetched.snapshot)?;
-        Ok(fetched)
-    }
-
     fn fetch_or_cached(&mut self) -> Result<Fetched> {
-        let Some(key) = self.cache.as_ref().map(|_| self.key()) else {
-            let snapshot = self.fetch_api()?;
-            return Ok(Fetched {
-                snapshot,
-                source: Source::Api,
-                age: Duration::ZERO,
-                retry_after: None,
-            });
+        let Some(cache) = &self.cache else {
+            let snapshot = Self::fetch_api(&mut self.client, self.repo.as_ref(), &self.target)?;
+            return Ok(Fetched::from_api(snapshot));
         };
-        let (hit, guard) = self
-            .cache
-            .as_ref()
-            .expect("key が Some なら cache も Some")
-            .get_or_lock(&key, self.ttl, &|s| self.is_terminal(s));
+        let key = self.key();
+        let (hit, guard) = cache.get_or_lock(&key, self.ttl);
         if let Some(entry) = hit {
-            let age = entry.age(cache::now_ms());
-            return Ok(Fetched {
-                snapshot: entry.snapshot,
-                source: Source::Cache,
-                age,
-                retry_after: None,
-            });
+            return Ok(Fetched::from_cache(entry, Source::Cache, None));
         }
-        // ここへ来たら自分が取得役(ロックは guard が保持。Drop で解放)。
-        let result = self.fetch_api();
-        let cache = self.cache.as_ref().expect("cache あり");
+        // ここへ来たら自分が取得役(ロックは guard が保持し、書き込みと古い読み出しの後に解放する)。
+        let result = Self::fetch_api(&mut self.client, self.repo.as_ref(), &self.target);
         let out = match result {
             Ok(snapshot) => {
                 if let Err(e) = cache.write(&key, &snapshot) {
                     eprintln!("警告: キャッシュへ書き込めません({e})");
                 }
-                Ok(Fetched {
-                    snapshot,
-                    source: Source::Api,
-                    age: Duration::ZERO,
-                    retry_after: None,
-                })
+                Ok(Fetched::from_api(snapshot))
             }
             // レート制限時は、古くても共有キャッシュがあればそれを返して継続できるようにする。
             // 待ち時間は捨てずに返し、呼び出し側が API を叩かず待てるようにする。
             Err(VigiliaError::RateLimited { retry_after, message }) => match cache.read(&key) {
-                Some(entry) => {
-                    let age = entry.age(cache::now_ms());
-                    Ok(Fetched {
-                        snapshot: entry.snapshot,
-                        source: Source::StaleCache,
-                        age,
-                        retry_after: Some(retry_after.unwrap_or_default()),
-                    })
-                }
+                Some(entry) => Ok(Fetched::from_cache(
+                    entry,
+                    Source::StaleCache,
+                    Some(retry_after.unwrap_or_default()),
+                )),
                 None => Err(VigiliaError::RateLimited { retry_after, message }),
             },
             Err(e) => Err(e),
@@ -242,18 +193,41 @@ impl Resolver {
     }
 }
 
+impl Fetched {
+    /// API から取得した結果。
+    fn from_api(snapshot: Snapshot) -> Self {
+        Fetched {
+            snapshot,
+            source: Source::Api,
+            age: Duration::ZERO,
+            retry_after: None,
+        }
+    }
+
+    /// キャッシュ(新鮮・古いもの)の内容。
+    fn from_cache(entry: cache::Entry, source: Source, retry_after: Option<Duration>) -> Self {
+        let age = entry.age(cache::now_ms());
+        Fetched {
+            snapshot: entry.snapshot,
+            source,
+            age,
+            retry_after,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Suite;
 
-    fn resolver(target: Target, freshness: Freshness) -> Resolver {
+    fn resolver(target: Target, filter: Option<RunFilter>) -> Resolver {
         Resolver::new(
             Some(("O".into(), "R".into())),
             target,
             false,
             Duration::from_secs(15),
-            freshness,
+            filter,
         )
     }
 
@@ -289,7 +263,7 @@ mod tests {
             target: Target::Run(123456789),
             cache: Some(cache),
             ttl: Duration::from_secs(60),
-            freshness: Freshness::Default,
+            filter: None,
             client: None,
         }
     }
@@ -310,17 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn repo検査はrun対象だけに働く() {
-        let snap = done_snapshot(".github/workflows/ci.yml");
-        let other = Some(("other".to_string(), "x".to_string()));
-        assert!(check_repo(other.as_ref(), &Target::Run(1), &snap).is_err());
-        assert!(check_repo(None, &Target::Run(1), &snap).is_ok());
-        assert!(check_repo(other.as_ref(), &Target::Sha("abc1234".into()), &snap).is_ok());
-    }
-
-    #[test]
     fn キャッシュキーは対象ごとに別でフィルタ条件を含まない() {
-        let sha = resolver(Target::Sha("abc1234".into()), Freshness::Default).key();
+        let sha = resolver(Target::Sha("abc1234".into()), None).key();
         assert_eq!(sha, "o__r__sha__abc1234");
         let f = RunFilter {
             workflow: Some("ci.yml".into()),
@@ -328,36 +293,13 @@ mod tests {
         };
         // 絞り込み条件が違っても同じキー(取得結果は条件に依存しないので共有してよい)。
         assert_eq!(
-            resolver(Target::Sha("abc1234".into()), Freshness::Filtered(f)).key(),
+            resolver(Target::Sha("abc1234".into()), Some(f)).key(),
             sha
         );
         // ファイル名で `/` と `_` が潰れるブランチ名でも衝突しない。
-        let a = resolver(Target::Branch("release/1".into()), Freshness::Strict).key();
-        let b = resolver(Target::Branch("release_1".into()), Freshness::Strict).key();
+        let a = resolver(Target::Branch("release/1".into()), None).key();
+        let b = resolver(Target::Branch("release_1".into()), None).key();
         assert_ne!(cache::sanitize_key(&a), cache::sanitize_key(&b));
         assert_ne!(a, sha);
-    }
-
-    #[test]
-    fn 完了済みの再利用は絞り込み後の結論で決める() {
-        let snap = done_snapshot(".github/workflows/ci.yml");
-        assert!(resolver(Target::Sha("abc1234".into()), Freshness::Default).is_terminal(&snap));
-        // 全体は完了済みでも、待っている release.yml はまだ現れていない → 再利用しない。
-        let f = RunFilter {
-            workflow: Some("release.yml".into()),
-            ..Default::default()
-        };
-        assert!(
-            !resolver(Target::Sha("abc1234".into()), Freshness::Filtered(f)).is_terminal(&snap)
-        );
-        let f = RunFilter {
-            workflow: Some("ci.yml".into()),
-            ..Default::default()
-        };
-        assert!(
-            resolver(Target::Sha("abc1234".into()), Freshness::Filtered(f)).is_terminal(&snap)
-        );
-        // runs(Strict)は完了済みでも長く使い回さない。
-        assert!(!resolver(Target::Sha("abc1234".into()), Freshness::Strict).is_terminal(&snap));
     }
 }

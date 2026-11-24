@@ -5,7 +5,7 @@ Vigilia は、GitHub Actions の状態を GraphQL で取得し、ファイルキ
 
 ## 必須コマンド
 
-CI（`.github/workflows/ci.yml`、windows / macos / ubuntu の3環境）と同じ検査を、変更後に通す。
+CI（`.github/workflows/ci.yml`、windows / macos / ubuntu の3環境）と同じ検査を、変更後に通す。`install.*` / `scripts/` / `tests/` を変えたら `pwsh -NoProfile -File tests/Test-Install.ps1` も通す。
 
 ```powershell
 cargo build --locked

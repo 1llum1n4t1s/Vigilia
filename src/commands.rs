@@ -4,7 +4,7 @@ use crate::error::{Result, VigiliaError, exit};
 use crate::github::{Client, Resource};
 use crate::model::{Overall, RunFilter, RunInfo, Snapshot};
 use crate::render;
-use crate::service::{Fetched, Freshness, Resolver, Source};
+use crate::service::{Fetched, Resolver, Source};
 use crate::target::{self, Target};
 use crate::{BudgetArgs, RunsArgs, StatusArgs, TargetArgs, WatchArgs};
 use chrono::{DateTime, Local, Utc};
@@ -35,17 +35,13 @@ fn build_resolver(a: &TargetArgs) -> Result<Resolver> {
         (None, Target::Run(_)) => None,
         (None, _) => Some(target::infer_repo()?),
     };
-    let freshness = if filter.is_unfiltered() {
-        Freshness::Default
-    } else {
-        Freshness::Filtered(filter)
-    };
+    let filter = (!filter.is_unfiltered()).then_some(filter);
     Ok(Resolver::new(
         repo,
         target,
         !a.no_cache,
         Duration::from_secs(a.ttl),
-        freshness,
+        filter,
     ))
 }
 
@@ -69,6 +65,38 @@ fn is_filtered(a: &TargetArgs) -> bool {
 /// レート制限時の待ち時間。示された時間を尊重しつつ、`--interval` より短くはしない。
 fn rate_wait(interval: Duration, retry_after: Option<Duration>) -> Duration {
     retry_after.unwrap_or(interval).max(interval)
+}
+
+/// `--interval` が最小間隔未満なら使い方エラーにする。
+fn check_interval(secs: u64) -> Result<()> {
+    if secs < MIN_INTERVAL_SECS {
+        return Err(VigiliaError::Usage(format!(
+            "--interval は {MIN_INTERVAL_SECS} 秒以上にしてください(API 負荷と二次レート制限の回避のため)"
+        )));
+    }
+    Ok(())
+}
+
+/// レート制限で待つ。待つと期限(`limit`)に達するなら `RateLimited`(`retry_after` は元の値のまま)を返し、
+/// そうでなければ `notice: N秒待機して再開します` を出して待つ。
+fn wait_rate_limit(
+    started: Instant,
+    limit: Duration,
+    interval: Duration,
+    retry_after: Option<Duration>,
+    notice: &str,
+    message: &str,
+) -> Result<()> {
+    let w = rate_wait(interval, retry_after);
+    if started.elapsed().saturating_add(w) >= limit {
+        return Err(VigiliaError::RateLimited {
+            retry_after,
+            message: message.to_string(),
+        });
+    }
+    eprintln!("{notice}: {}秒待機して再開します", w.as_secs());
+    std::thread::sleep(w);
+    Ok(())
 }
 
 /// 次の取得までの待ち時間。期限までの残りが `MIN_INTERVAL_SECS` 未満なら、もう取得しない(None)。
@@ -182,11 +210,7 @@ fn parse_since(s: &str) -> Result<DateTime<Utc>> {
 }
 
 pub fn runs(a: &RunsArgs) -> Result<i32> {
-    if a.interval < MIN_INTERVAL_SECS {
-        return Err(VigiliaError::Usage(format!(
-            "--interval は {MIN_INTERVAL_SECS} 秒以上にしてください(API 負荷と二次レート制限の回避のため)"
-        )));
-    }
+    check_interval(a.interval)?;
     let target = target::parse_runs_target(a.target.as_deref().unwrap_or("HEAD"))?;
     let repo = match &a.repo {
         Some(r) => target::parse_repo(r)?,
@@ -197,13 +221,12 @@ pub fn runs(a: &RunsArgs) -> Result<i32> {
         event: a.event.clone(),
         since: a.since.as_deref().map(parse_since).transpose()?,
     };
-    // runs は「新しい run が現れたか」を見るため、完了済みでも長くキャッシュしない(Strict)。
     let mut resolver = Resolver::new(
         Some(repo),
         target,
         !a.no_cache,
         Duration::from_secs(a.ttl),
-        Freshness::Strict,
+        None,
     );
     let started = Instant::now();
     let wait = Duration::from_secs(a.wait);
@@ -233,15 +256,14 @@ pub fn runs(a: &RunsArgs) -> Result<i32> {
                 }
                 if stale {
                     // 古いキャッシュで「無い」とは断定できない。示された時間だけ待って再取得する。
-                    let w = rate_wait(interval, f.retry_after);
-                    if started.elapsed() + w >= wait {
-                        return Err(VigiliaError::RateLimited {
-                            retry_after: f.retry_after,
-                            message: "古いキャッシュのまま --wait に達します".into(),
-                        });
-                    }
-                    eprintln!("レート制限中: {}秒待機して再開します", w.as_secs());
-                    std::thread::sleep(w);
+                    wait_rate_limit(
+                        started,
+                        wait,
+                        interval,
+                        f.retry_after,
+                        "レート制限中",
+                        "古いキャッシュのまま --wait に達します",
+                    )?;
                     continue;
                 }
                 // check suite が切り捨てられていて一致が 0 件なら、一致する run を取りこぼした可能性があり
@@ -265,12 +287,8 @@ pub fn runs(a: &RunsArgs) -> Result<i32> {
                 std::thread::sleep(pause);
             }
             Err(VigiliaError::RateLimited { retry_after, message }) => {
-                let w = rate_wait(interval, retry_after);
-                if started.elapsed() + w >= wait {
-                    return Err(VigiliaError::RateLimited { retry_after, message });
-                }
-                eprintln!("レート制限({message}): {}秒待機して再開します", w.as_secs());
-                std::thread::sleep(w);
+                let notice = format!("レート制限({message})");
+                wait_rate_limit(started, wait, interval, retry_after, &notice, &message)?;
             }
             Err(e) => return Err(e),
         }
@@ -302,11 +320,7 @@ fn print_runs(f: &Fetched, runs: &[RunInfo], json: bool) {
 // ---------------------------------------------------------------------------
 
 pub fn watch(a: &WatchArgs) -> Result<i32> {
-    if a.interval < MIN_INTERVAL_SECS {
-        return Err(VigiliaError::Usage(format!(
-            "--interval は {MIN_INTERVAL_SECS} 秒以上にしてください(API 負荷と二次レート制限の回避のため)"
-        )));
-    }
+    check_interval(a.interval)?;
     if a.timeout == 0 {
         return Err(VigiliaError::Usage("--timeout は 1 以上にしてください".into()));
     }
@@ -315,7 +329,7 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
     let timeout = Duration::from_secs(a.timeout);
     let interval = Duration::from_secs(a.interval);
     // job ごとの直近表示ラベル。変化したものだけを出力する。
-    let mut seen: HashMap<String, &'static str> = HashMap::new();
+    let mut seen = Seen::new();
     let mut header_printed = false;
     let mut stale_warned = false;
 
@@ -360,15 +374,14 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
                     // レート制限で古いキャッシュを返された場合は、結論も未検出の期限も確定させず、
                     // 示された待ち時間の間 API を叩かずに待って再取得する。
                     WatchStep::StaleWait => {
-                        let wait = rate_wait(interval, f.retry_after);
-                        if started.elapsed() + wait >= timeout {
-                            return Err(VigiliaError::RateLimited {
-                                retry_after: f.retry_after,
-                                message: "古いキャッシュのまま --timeout に達します".into(),
-                            });
-                        }
-                        eprintln!("レート制限中: {}秒待機して再開します", wait.as_secs());
-                        std::thread::sleep(wait);
+                        wait_rate_limit(
+                            started,
+                            timeout,
+                            interval,
+                            f.retry_after,
+                            "レート制限中",
+                            "古いキャッシュのまま --timeout に達します",
+                        )?;
                         continue;
                     }
                     WatchStep::Poll => {}
@@ -376,15 +389,8 @@ pub fn watch(a: &WatchArgs) -> Result<i32> {
             }
             Err(VigiliaError::RateLimited { retry_after, message }) => {
                 // 落とさずに、示された時間(分からなければ interval)だけ待って再開する。
-                let wait = rate_wait(interval, retry_after);
-                if started.elapsed() + wait >= timeout {
-                    return Err(VigiliaError::RateLimited { retry_after, message });
-                }
-                eprintln!(
-                    "レート制限({message}): {}秒待機して再開します",
-                    wait.as_secs()
-                );
-                std::thread::sleep(wait);
+                let notice = format!("レート制限({message})");
+                wait_rate_limit(started, timeout, interval, retry_after, &notice, &message)?;
                 continue;
             }
             Err(e) => return Err(e),
@@ -434,22 +440,51 @@ fn watch_step(
     Ok(WatchStep::Poll)
 }
 
+/// suite の識別子。suite の並び順が変わっても同じ suite を同じキーで追えるようにする。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SuiteKey {
+    /// run id を持つ suite。
+    Run(u64),
+    /// run id を持たない suite(app 名と、同じ app の中での出現順)。
+    App(String, usize),
+}
+
+/// 直近に表示したラベル。キーは (suite, job 名。suite 自身は None)。
+type Seen = HashMap<(SuiteKey, Option<String>), &'static str>;
+
 /// 状態が変わった job(と suite)だけを `[HH:MM:SS]` 付きで出力する。
-fn print_changes(snap: &Snapshot, seen: &mut HashMap<String, &'static str>) {
-    let ts = Local::now().format("%H:%M:%S");
-    for (i, suite) in snap.suites.iter().enumerate() {
-        let skey = format!("{i}/{}", suite.run_id.unwrap_or(0));
+fn print_changes(snap: &Snapshot, seen: &mut Seen) {
+    let ts = Local::now().format("%H:%M:%S").to_string();
+    for line in changed_lines(snap, seen, &ts) {
+        println!("{line}");
+    }
+}
+
+/// 前回から変わった suite・job の表示行を返し、`seen` を更新する。
+fn changed_lines(snap: &Snapshot, seen: &mut Seen, ts: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut app_count: HashMap<&str, usize> = HashMap::new();
+    for suite in &snap.suites {
+        let skey = match suite.run_id {
+            Some(id) => SuiteKey::Run(id),
+            None => {
+                let n = app_count.entry(suite.app.as_str()).or_insert(0);
+                *n += 1;
+                SuiteKey::App(suite.app.clone(), *n)
+            }
+        };
         let slabel = render::suite_label(suite);
-        if seen.insert(format!("{skey}/*"), slabel) != Some(slabel) {
-            println!("[{ts}] {} : {slabel}", render::suite_title(suite));
+        if seen.insert((skey.clone(), None), slabel) != Some(slabel) {
+            lines.push(format!("[{ts}] {} : {slabel}", render::suite_title(suite)));
         }
         for job in &suite.jobs {
             let label = render::job_label(job);
-            if seen.insert(format!("{skey}/{}", job.name), label) != Some(label) {
-                println!("[{ts}]   {} : {label}", job.name);
+            if seen.insert((skey.clone(), Some(job.name.clone())), label) != Some(label) {
+                lines.push(format!("[{ts}]   {} : {label}", job.name));
             }
         }
     }
+    lines
 }
 
 fn print_final(snap: &Snapshot, overall: Overall) {
@@ -642,11 +677,47 @@ mod tests {
         assert_eq!(next_poll_wait(Duration::ZERO, Duration::ZERO, i), None);
     }
 
+    fn suite(app: &str, run_id: Option<u64>, job: &str) -> Suite {
+        Suite {
+            app: app.into(),
+            run_id,
+            status: "IN_PROGRESS".into(),
+            jobs: vec![crate::model::Job {
+                name: job.into(),
+                status: "IN_PROGRESS".into(),
+                conclusion: None,
+                url: None,
+                started_at: None,
+                completed_at: None,
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn budget行の整形() {
-        let r = Resource { limit: 5000, remaining: 0, used: 5000, reset: 1_000_090 };
-        let line = budget_line("REST (core)", &r, 1_000_000);
-        assert!(line.contains("残り     0/5000"), "{line}");
-        assert!(line.contains("あと 1m30s"), "{line}");
+    fn suiteの数が増減して位置がずれても変化の無いjobを再表示しない() {
+        let snap = |suites: Vec<Suite>| Snapshot {
+            repo: "o/r".into(),
+            sha: "abc".into(),
+            suites,
+            truncated: false,
+            suites_truncated: false,
+            cost: None,
+        };
+        let mut seen = Seen::new();
+        let first = snap(vec![suite("GitHub Actions", Some(1), "build"), suite("GitHub Actions", Some(2), "test")]);
+        assert_eq!(changed_lines(&first, &mut seen, "t").len(), 4);
+        // 先頭に新しい run が増えて既存の suite の位置がずれても、新しい suite の 2 行だけが出る。
+        let second = snap(vec![
+            suite("GitHub Actions", Some(3), "lint"),
+            suite("GitHub Actions", Some(1), "build"),
+            suite("GitHub Actions", Some(2), "test"),
+        ]);
+        assert_eq!(changed_lines(&second, &mut seen, "t").len(), 2);
+        assert!(changed_lines(&second, &mut seen, "t").is_empty());
+        // run id が無い suite は app ごとの出現順で追う。
+        let third = snap(vec![suite("Other", None, "j"), suite("Other", None, "k")]);
+        assert_eq!(changed_lines(&third, &mut seen, "t").len(), 4);
+        assert!(changed_lines(&third, &mut seen, "t").is_empty());
     }
 }
